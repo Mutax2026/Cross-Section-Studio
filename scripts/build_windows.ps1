@@ -7,7 +7,7 @@ $VersionFile = Join-Path $Root "VERSION"
 if (-not (Test-Path $VersionFile)) {
     Write-Error "VERSION file not found at $VersionFile"
 }
-$Version = (Get-Content -Path $VersionFile -Raw).Trim().TrimStart("v", "V")
+$Version = ((Get-Content -Path $VersionFile -Raw).Trim() -replace '^[vV]', '').Trim()
 if (-not $Version) {
     Write-Error "VERSION file is empty"
 }

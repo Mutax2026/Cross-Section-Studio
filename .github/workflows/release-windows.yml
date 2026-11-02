@@ -24,7 +24,7 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $version = (Get-Content VERSION -Raw).Trim().TrimStart("v", "V")
+          $version = ((Get-Content VERSION -Raw).Trim() -replace '^[vV]', '').Trim()
           if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$version") {
             Write-Error "Tag $env:GITHUB_REF_NAME does not match VERSION $version"
           }
