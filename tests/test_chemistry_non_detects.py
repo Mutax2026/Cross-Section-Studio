@@ -346,6 +346,28 @@ def test_rdl_above_guideline_notes_use_explicit_limits_only() -> None:
     assert rdl_above_guideline_notes([nd_high], {}) == []
 
 
+def test_rdl_is_converted_to_the_guideline_unit_before_comparing() -> None:
+    # Guideline is in Benzene's main unit (mg/L, most rows); the ug/L non-detect
+    # is converted to mg/L first: 2 ug/L = 0.002 mg/L is below 0.005 mg/L.
+    detected = [_reading(1.0, unit="mg/L"), _reading(0.2, unit="mg/L", hole="BH-03")]
+    thresholds = {"Benzene": (0.005, 0.005)}
+    below = _reading(2.0, detected=False, hole="BH-02", unit="ug/L", depth=3.0)
+    assert rdl_above_guideline_notes([*detected, below], thresholds) == []
+    above = _reading(10.0, detected=False, hole="BH-02", unit="ug/L", depth=3.0)
+    assert rdl_above_guideline_notes([*detected, above], thresholds) == [
+        "BH-02 Benzene at 3 m: detection limit 0.01 mg/L exceeds guideline 0.005 mg/L — result inconclusive"
+    ]
+
+
+def test_rdl_in_an_unconvertible_unit_is_not_compared() -> None:
+    detected = [_reading(1.0, unit="mg/L"), _reading(0.2, unit="mg/L", hole="BH-03")]
+    foreign = _reading(2.0, detected=False, hole="BH-02", unit="mg/kg", depth=3.0)
+    assert rdl_above_guideline_notes([*detected, foreign], {"Benzene": (0.005, None)}) == [
+        "BH-02 Benzene at 3 m: detection limit 2 mg/kg not compared with guideline 0.005 mg/L"
+        " — mg/kg cannot be converted to mg/L"
+    ]
+
+
 def test_validate_summary_lists_rdl_and_mixed_unit_warnings() -> None:
     collars = [
         Collar(hole_id=h, easting=i * 30.0, northing=0.0, elevation=100.0, total_depth=12.0)

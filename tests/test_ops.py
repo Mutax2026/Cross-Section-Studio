@@ -346,3 +346,49 @@ def test_logout_wipes_every_parse_and_section_key() -> None:
     _clear_sensitive_session_on_logout(session)
     assert not [key for key in keys if key in session]
     assert "unrelated" not in session
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "kept"),
+    [
+        ("Authorization: Bearer aaa.bbb.ccc+ddd/eee=", "aaa.bbb", "Authorization: Bearer [redacted]"),
+        ("Bearer aaa.bbb.ccc+ddd/eee=", "ccc+ddd", "Bearer [redacted]"),
+        ("bearer abc-def_ghi~jkl", "abc-def", "bearer [redacted]"),
+        ("CROSS_SECTION_AUTH_PASSWORD=hunter2", "hunter2", "CROSS_SECTION_AUTH_PASSWORD=[redacted]"),
+        ("MY_SERVICE_TOKEN=abc123 ok", "abc123", "MY_SERVICE_TOKEN=[redacted] ok"),
+        ("OTHER_SECRET=s3cr3t", "s3cr3t", "OTHER_SECRET=[redacted]"),
+        ("GROQ_API_KEY=live1234", "live1234", "GROQ_API_KEY=[redacted]"),
+        ("AWS_KEY='abc def'", "abc def", "AWS_KEY=[redacted]"),
+        ('{"api_key": "hunter2secret"}', "hunter2secret", '{"api_key": "[redacted]"}'),
+        ('{"password": "pw1", "n": 1}', "pw1", '{"password": "[redacted]", "n": 1}'),
+        ('{"token": "tk1"}', "tk1", '{"token": "[redacted]"}'),
+        ('{"secret": "sc1"}', "sc1", '{"secret": "[redacted]"}'),
+        ("{'Authorization': 'Bearer abc.def'}", "abc.def", "{'Authorization': '[redacted]'}"),
+        ("/cb?access_token=supersecretvalue&state=ok", "supersecret", "/cb?access_token=[redacted]&state=ok"),
+        ("/v1?token=t1x&page=2", "t1x", "/v1?token=[redacted]&page=2"),
+        ("/v1?a=1&api_key=k9z#top", "k9z", "/v1?a=1&api_key=[redacted]#top"),
+        ("/v1?key=k1z&password=p1z", "p1z", "/v1?key=[redacted]&password=[redacted]"),
+        ("password=hunter2", "hunter2", "password=[redacted]"),
+    ],
+)
+def test_redact_secrets_covers_headers_env_json_and_query(text: str, secret: str, kept: str) -> None:
+    from ops_logging import redact_secrets
+
+    redacted = redact_secrets(text)
+    assert secret not in redacted
+    assert redacted == kept
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The token expired; refresh the token and retry.",
+        "keyboard=1 monkey=2 turkey=3",
+        "MY_TOKEN_TTL=30 sort order kept",
+        '{"name": "Benzene", "unit": "mg/L"}',
+    ],
+)
+def test_redact_secrets_leaves_ordinary_text_alone(text: str) -> None:
+    from ops_logging import redact_secrets
+
+    assert redact_secrets(text) == text

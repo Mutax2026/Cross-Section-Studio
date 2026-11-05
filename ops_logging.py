@@ -9,11 +9,50 @@ import re
 import sys
 from datetime import UTC, datetime
 
+# Applied in order. Later patterns skip a value already "[redacted]" so a
+# rule never re-redacts (and swallows) text an earlier rule left alone.
+_NOT_REDACTED = r"(?!\[redacted\])"
 _SECRET_PATTERNS = (
-    (re.compile(r"(?i)\b(api[_-]?key|password|secret|token)\s*[=:]\s*\S+"), r"\1=[redacted]"),
-    (re.compile(r"(?i)([?&])(api[_-]?key|key|password|token)=([^&\s]+)"), r"\1\2=[redacted]"),
-    (re.compile(r"(?i)\bauthorization\s*[=:]\s*\S+"), "authorization=[redacted]"),
-    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+"), "Bearer [redacted]"),
+    # URL query parameters: ?access_token=...&state=ok keeps the other params.
+    (
+        re.compile(
+            r"(?i)([?&])((?:access_|refresh_|id_)?token|api[_-]?key|key|password|client_secret|secret)"
+            r"=([^&\s#]+)"
+        ),
+        r"\1\2=[redacted]",
+    ),
+    # JSON / dict-repr fields: {"api_key": "x"} -> {"api_key": "[redacted]"}.
+    (
+        re.compile(
+            r"""(?i)((["'])(?:[\w-]*(?:api[_-]?key|password|passwd|secret|token)|authorization)\2"""
+            r"""\s*:\s*)(["'])(?:\\.|(?!\3).)*\3"""
+        ),
+        r"\1\3[redacted]\3",
+    ),
+    # Authorization header, scheme kept: "Authorization: Bearer [redacted]".
+    (
+        re.compile(
+            r"(?i)\b(authorization\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?)"
+            + _NOT_REDACTED
+            + r"\S+"
+        ),
+        r"\1[redacted]",
+    ),
+    # Bare bearer token, including JWT dots and base64 + / = characters.
+    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/\-]+=*"), r"\1[redacted]"),
+    # Env-style assignments: CROSS_SECTION_AUTH_PASSWORD=..., GROQ_API_KEY=...
+    (
+        re.compile(
+            r"(?i)\b([A-Za-z0-9_]*_(?:password|passwd|token|secret|key))(\s*=\s*)"
+            + _NOT_REDACTED
+            + r"""("[^"]*"|'[^']*'|\S+)"""
+        ),
+        r"\1\2[redacted]",
+    ),
+    (
+        re.compile(r"(?i)\b(api[_-]?key|password|secret|token)\s*[=:]\s*" + _NOT_REDACTED + r"\S+"),
+        r"\1=[redacted]",
+    ),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"), "sk-[redacted]"),
     (re.compile(r"\bAIza[0-9A-Za-z_-]{10,}"), "AIza[redacted]"),
     (re.compile(r"\bgsk_[A-Za-z0-9]{10,}"), "gsk_[redacted]"),
