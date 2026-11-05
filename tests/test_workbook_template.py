@@ -201,3 +201,55 @@ def test_export_cleaned_workbook_bytes_roundtrip() -> None:
     project = load_project_metadata(BytesIO(payload))
     assert project.get("client_name") == "TEST CLIENT"
     assert project.get("figure_preset") == "gwm_fence"
+
+def test_data_entry_hole_ids_that_start_with_a_banner_word_stay_data_rows() -> None:
+    """Review F3: WATER-01 / WATERLOO-2 / PROJECT-7 were read as section banners,
+    dropping the hole and every row beneath it with no error."""
+    import pandas as pd
+
+    from workbook_template import parse_data_entry_sheet
+
+    frame = pd.DataFrame(
+        [
+            ["COLLARS", "", "", "", ""],
+            ["hole_id", "easting", "northing", "elevation", "total_depth"],
+            ["BH-01", 0, 0, 100, 10],
+            ["WATER-01", 10, 0, 100, 10],
+            ["PROJECT-7", 15, 0, 100, 10],
+            ["BH-02", 20, 0, 100, 10],
+            ["LITHOLOGY (required)", "", "", "", ""],
+            ["hole_id", "from_depth", "to_depth", "lithology_code", ""],
+            ["BH-01", 0, 10, "Clay", ""],
+            ["WATER-01", 0, 10, "Clay", ""],
+            ["WATERLOO-2", 0, 10, "Clay", ""],
+            ["Screens-A", 0, 10, "Sand", ""],
+            ["BH-02", 0, 10, "Clay", ""],
+            ["Water (optional)", "", "", "", ""],
+            ["hole_id", "depth", "", "", ""],
+            ["WATER-01", 3, "", "", ""],
+        ]
+    )
+    sheets = parse_data_entry_sheet(frame)
+    assert list(sheets.collars["hole_id"]) == ["BH-01", "WATER-01", "PROJECT-7", "BH-02"]
+    assert list(sheets.lithology["hole_id"]) == [
+        "BH-01",
+        "WATER-01",
+        "WATERLOO-2",
+        "Screens-A",
+        "BH-02",
+    ]
+    assert list(sheets.water["hole_id"]) == ["WATER-01"]
+
+
+def test_data_entry_banners_as_the_template_writes_them_still_open_sections() -> None:
+    """Every banner on the template's Example sheet (same layout as Data Entry)
+    still opens its section after the exact-banner match."""
+    import pandas as pd
+
+    from workbook_template import parse_data_entry_sheet
+
+    workbook = pd.ExcelFile(BytesIO(build_input_template_bytes()))
+    sheets = parse_data_entry_sheet(pd.read_excel(workbook, "Example", header=None))
+    for name in ("collars", "lithology", "water", "environmental", "screens", "gradients"):
+        assert not getattr(sheets, name).empty, name
+    assert sheets.project  # "PROJECT / CLIENT METADATA" block

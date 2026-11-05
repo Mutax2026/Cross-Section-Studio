@@ -10,6 +10,7 @@ Sheets:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -113,6 +114,21 @@ TABLE_SECTIONS: dict[str, tuple[str, ...]] = {
     "SCREENS": SCREEN_COLUMNS,
     "GRADIENTS": GRADIENT_COLUMNS,
 }
+
+
+def _banner_pattern(key: str, qualifier: str = "") -> re.Pattern[str]:
+    # The key, an optional " / …" qualifier, then an optional "(…)" note.
+    return re.compile(rf"{key}{qualifier}(?:\s*\(.*\))?")
+
+
+# Data Entry banners as the template writes them ("COLLARS (required)",
+# "ENVIRONMENTAL / LAB (optional)", "PROJECT / CLIENT METADATA"). A hole id that
+# only starts with a key (WATER-01, WATERLOO-2) is a data row, not a banner.
+_SECTION_BANNERS: dict[str, re.Pattern[str]] = {
+    key: _banner_pattern(key, r"(?:\s*/\s*LAB)?" if key == "ENVIRONMENTAL" else "")
+    for key in TABLE_SECTIONS
+}
+_PROJECT_BANNER = _banner_pattern("PROJECT", r"(?:\s*/\s*CLIENT\s+METADATA)?")
 
 _HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
 _HEADER_FONT = Font(color="FFFFFF", bold=True, name="Calibri", size=11)
@@ -655,8 +671,8 @@ def parse_data_entry_sheet(frame: pd.DataFrame) -> DataEntrySheets:
         upper = first.upper()
 
         matched_section: str | None = None
-        for key in TABLE_SECTIONS:
-            if upper.startswith(key):
+        for key, banner in _SECTION_BANNERS.items():
+            if banner.fullmatch(upper):
                 matched_section = key
                 break
         if matched_section:
@@ -664,7 +680,7 @@ def parse_data_entry_sheet(frame: pd.DataFrame) -> DataEntrySheets:
             mode = "table_header"
             continue
 
-        if upper.startswith("PROJECT") and _normalize_key(first) not in project_fields:
+        if _PROJECT_BANNER.fullmatch(upper) and _normalize_key(first) not in project_fields:
             mode = "project"
             current_section = None
             continue
