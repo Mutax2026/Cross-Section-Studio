@@ -404,3 +404,88 @@ def test_batch_sections_carry_the_workbook_wide_flow_note() -> None:
     _, request = prepare_batch_section_request(parse_result, base, spec)
     assert request.groundwater_flow_notes
     assert "4 wells" in " ".join(request.groundwater_flow_notes)
+
+
+# --- placeholder RL / CRS reach batch sheets; DRAFT on the binder cover ------
+
+
+def _pdf_text(payload: bytes) -> str:
+    from pypdf import PdfReader
+
+    return " ".join(page.extract_text() or "" for page in PdfReader(BytesIO(payload)).pages)
+
+
+@pytest.mark.parametrize("layout", ["section_sheet", "consulting_section"])
+def test_batch_sheets_carry_placeholder_elevation_and_crs(layout: str) -> None:
+    """Batch passed ``request.figure_metadata`` (always None from the app), so
+    batch PDFs lost the placeholder-RL warning and CRS/datum that the same
+    section built on Generate prints."""
+    pytest.importorskip("pypdf")
+    clear_batch_geometry_memo()
+    base = SectionBuildRequest(
+        transect_points=((0.0, 0.0), (100.0, 0.0)),
+        section_title="Site A-A'",
+        render_layout=layout,
+        coordinate_reference="EPSG:26912",
+        uses_placeholder_elevation=True,
+    )
+    spec = BatchTransectSpec(label="A-A'", hole_ids=("BH-01", "BH-02", "BH-03"))
+    _label, _svg, _png, pdf = build_one_transect_exports(
+        _four_hole_parse(), base, spec, export_formats=frozenset({"pdf"})
+    )
+    text = _pdf_text(pdf)
+    assert "PLACEHOLDER COLLAR ELEVATION" in text.upper()
+    if layout == "section_sheet":  # the consulting sheet has no CRS footer
+        assert "EPSG:26912" in text
+    clear_batch_geometry_memo()
+
+
+@pytest.mark.parametrize(
+    ("elevation_mode", "placeholder"),
+    [("absolute", True), ("absolute", False), ("relative", True)],
+)
+def test_batch_figure_metadata_matches_generate_path(elevation_mode: str, placeholder: bool) -> None:
+    """Batch sheets follow the same metadata rules as the Generate path."""
+    from app_services import _build_section_kwargs
+    from batch_export import batch_figure_metadata
+
+    base = SectionBuildRequest(
+        transect_points=((0.0, 0.0), (100.0, 0.0)),
+        section_title="Site",
+        coordinate_reference="EPSG:26912",
+        elevation_mode=elevation_mode,
+        uses_placeholder_elevation=placeholder,
+    )
+    subset, request = prepare_batch_section_request(
+        _four_hole_parse(), base, BatchTransectSpec(label="A-A'", hole_ids=("BH-01", "BH-02"))
+    )
+    expected, _mode, _overrides = _build_section_kwargs(subset, request)
+    assert batch_figure_metadata(subset, request) == expected
+    assert expected.uses_placeholder_elevation is (placeholder and elevation_mode == "absolute")
+
+
+@pytest.mark.parametrize("draft", [True, False])
+def test_binder_cover_stamped_draft_with_the_sections(draft: bool) -> None:
+    """Section sheets carried DRAFT but the binder cover in front of them did not."""
+    pypdf = pytest.importorskip("pypdf")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    from export_framing import ExportFramingConfig
+
+    def _page(label: str) -> bytes:
+        buf = BytesIO()
+        with PdfPages(buf) as pdf:
+            fig, ax = plt.subplots(figsize=(11.0, 8.5))
+            ax.set_title(label)
+            pdf.savefig(fig)
+            plt.close(fig)
+        return buf.getvalue()
+
+    binder = export_binder_pdf(
+        [_page("A"), _page("B")],
+        cover_title="Site — Cross Sections A-A', B-B'",
+        export_framing=ExportFramingConfig(show_draft_watermark=draft),
+    )
+    cover_text = pypdf.PdfReader(BytesIO(binder)).pages[0].extract_text() or ""
+    assert ("DRAFT" in cover_text) is draft
