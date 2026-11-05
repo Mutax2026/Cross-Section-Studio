@@ -1211,3 +1211,136 @@ def test_template_without_lithology_sheet_is_rejected_not_loaded_empty() -> None
     book.save(buffer)
     with pytest.raises(ValueError, match=r"Missing required sheet\(s\): Lithology"):
         DataParser().parse_file(BytesIO(buffer.getvalue()))
+
+
+# --- Review 2026-11-05 F4 / F5 / F11: optional-sheet rows are never lost silently ---
+
+
+def test_screens_with_wrong_headers_is_reported_not_dropped() -> None:
+    """F4: a Screens tab headed top/bottom returned no rows and no error."""
+    extra = {"Screens": [{"hole_id": "BH1", "top": 2, "bottom": 5}]}
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert not result.screen_intervals
+    assert any(
+        "Screens sheet is missing the from_depth, to_depth columns" in error
+        for error in result.errors
+    ), result.errors
+    assert len(result.collars) == 2 and len(result.lithologies) == 2
+
+
+def test_header_only_optional_sheets_with_other_headers_stay_quiet() -> None:
+    """No rows under the wrong headers: nothing was lost, so no message."""
+    extra = {
+        "Screens": {"hole_id": [], "top": []},
+        "Gradients": {"hole_id": []},
+    }
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert not result.errors
+
+
+def test_gradients_without_direction_column_is_reported() -> None:
+    extra = {"Gradients": [{"hole_id": "BH1", "dir": "down"}]}
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert not result.vertical_gradients
+    assert any("Gradients sheet is missing the direction column" in e for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    ("sheet", "rows", "expected"),
+    [
+        ("Water Levels", [{"hole_id": "BH1", "depth": 3}], "rename the tab to Water."),
+        ("Groundwater", [{"hole_id": "BH1", "depth": 3}], "rename the tab to Water."),
+        (
+            "Well Screens",
+            [{"hole_id": "BH1", "top": 2, "bottom": 5}],
+            "rename the tab to Screens and add the from_depth, to_depth header(s) to row 1.",
+        ),
+    ],
+)
+def test_misnamed_water_and_screens_tabs_are_named_in_an_error(
+    sheet: str, rows: list[dict], expected: str
+) -> None:
+    """F4: a tab named "Water Levels" was skipped with no message."""
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, {sheet: rows}))
+    assert not result.water_levels and not result.screen_intervals
+    matches = [e for e in result.errors if f"The '{sheet}' sheet was not read" in e]
+    assert len(matches) == 1 and matches[0].endswith(expected), result.errors
+
+
+def test_lookalike_tab_is_not_flagged_when_the_exact_tab_exists() -> None:
+    extra = {
+        "Water": [{"hole_id": "BH1", "depth": 3}],
+        "Water Levels (2019)": [{"hole_id": "BH1", "depth": 9}],
+        "Water Notes": [{"comment": "dipped with tape"}],
+    }
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert len(result.water_levels) == 1 and not result.errors
+
+
+def test_lookalike_tab_without_hole_rows_is_not_flagged() -> None:
+    extra = {"Water Quality Notes": [{"comment": "dipped with tape"}]}
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert not result.errors
+
+
+@pytest.mark.parametrize("sheet", ["Faults", "Unconformities"])
+@pytest.mark.parametrize(
+    ("x_profile", "elevation", "expected"),
+    [
+        ("12 m", 5, "x_profile '12 m' is not a number"),
+        (12, "abc", "elevation 'abc' is not a number"),
+        (True, 5, "x_profile = 'True' is a TRUE/FALSE cell"),
+    ],
+)
+def test_non_numeric_structure_coordinates_are_row_errors(
+    sheet: str, x_profile: object, elevation: object, expected: str
+) -> None:
+    """F5: float("12 m") escaped the row loop and parse_file raised."""
+    rows = [
+        {"name": "S1", "x_profile": x_profile, "elevation": elevation},
+        {"name": "S1", "x_profile": 20, "elevation": 5},
+        {"name": "S2", "x_profile": 0, "elevation": 1},
+        {"name": "S2", "x_profile": 30, "elevation": 2},
+    ]
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, {sheet: rows}))
+    assert len(result.collars) == 2 and len(result.lithologies) == 2
+    assert any(e.startswith(f"{sheet} sheet: {expected}") for e in result.errors), result.errors
+    kept = result.faults if sheet == "Faults" else result.unconformities
+    assert [item.name for item in kept] == ["S2"]
+
+
+def test_blank_hole_id_rows_on_optional_sheets_are_row_errors() -> None:
+    """F11: a Water / Screens / Gradients / Environmental row with data but no
+    hole_id was skipped silently. Fully blank padding rows stay quiet."""
+    blank = {"hole_id": None}
+    extra = {
+        "Water": [
+            {"hole_id": None, "depth": 3},
+            {"hole_id": "BH1", "depth": 4},
+            {"hole_id": None, "depth": None},
+        ],
+        "Screens": [
+            {"hole_id": None, "from_depth": 1, "to_depth": 2},
+            {"hole_id": "BH1", "from_depth": 1, "to_depth": 2},
+            {**blank, "from_depth": None, "to_depth": None},
+        ],
+        "Gradients": [
+            {"hole_id": None, "direction": "down"},
+            {"hole_id": "BH1", "direction": "up"},
+            {**blank, "direction": None},
+        ],
+        "Environmental": [
+            {"hole_id": None, "parameter": "Benzene", "value": 1, "depth": 2},
+            {"hole_id": "BH1", "parameter": "Benzene", "value": 1, "depth": 2},
+            {**blank, "parameter": None, "value": None, "depth": None},
+        ],
+    }
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert len(result.water_levels) == 1
+    assert len(result.screen_intervals) == 1
+    assert len(result.vertical_gradients) == 1
+    assert len(result.environmental_readings) == 1
+    assert sorted(result.errors) == sorted(
+        f"{sheet} row 2: hole_id is blank"
+        for sheet in ("Water", "Screens", "Gradients", "Environmental")
+    )
