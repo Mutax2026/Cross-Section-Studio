@@ -23,6 +23,7 @@ from chemistry_qc import (
     mixed_unit_warnings,
     rdl_above_guideline_notes,
 )
+from chemistry_qc import threshold_units as limits_units_of
 from constants import CANONICAL_LITHOLOGY_CODES
 from hydro_metrics import (
     APPARENT_LNAPL_THICKNESS_WARN_M,
@@ -1637,6 +1638,7 @@ def summarize_environmental_readings(
     hole_ids_on_transect: Sequence[str],
     *,
     thresholds: Mapping[str, tuple[float | None, float | None]] | None = None,
+    threshold_units: Mapping[str, str] | None = None,
 ) -> EnvironmentalQualitySummary:
     """Summarize lab/parameter coverage for Validate UI.
 
@@ -1645,6 +1647,12 @@ def summarize_environmental_readings(
     ``green_max`` values) and parameters reported in more than one unit,
     negative concentrations, inverted colour bands (green above orange) and
     samples far below their hole (left off the figure).
+
+    ``threshold_units`` (parameter -> unit) names the unit the limits are in;
+    default: the main unit of all ``readings`` (``chemistry_qc.threshold_units``),
+    the basis the workbook limits are read in. The non-detect check converts
+    each detection limit to it, though it looks only at the latest on-line
+    samples, which may favour another unit.
     """
     transect_holes = tuple(hole_ids_on_transect)
     hole_set = set(transect_holes)
@@ -1709,10 +1717,14 @@ def summarize_environmental_readings(
     warnings.extend(negative_concentration_warnings(on_line))
     if thresholds is None:
         thresholds = chemistry_thresholds_from_readings(readings)
+    if threshold_units is None:
+        # Same reading set as the workbook limits: every row, off-line holes
+        # and superseded dates included.
+        threshold_units = limits_units_of(readings)
     warnings.extend(chemistry_threshold_inversion_warnings(thresholds))
     warnings.extend(f"Info: {note}" for note in orange_only_limit_notes(thresholds))
     # Only the samples the figure draws (superseded dates are not plotted).
-    warnings.extend(rdl_above_guideline_notes(latest_on_line, thresholds))
+    warnings.extend(rdl_above_guideline_notes(latest_on_line, thresholds, threshold_units))
     warnings.extend(lab_qualifier_warnings(latest_on_line))
 
     if not readings and transect_holes:

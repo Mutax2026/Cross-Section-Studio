@@ -20,7 +20,9 @@ from chemistry_qc import (
     mixed_unit_warnings,
     rdl_above_guideline_notes,
     rdl_exceeds_guideline,
+    threshold_units,
     unit_key,
+    workbook_threshold_limits,
 )
 from models import Collar, EnvironmentalReading, Lithology
 from render_profiles import SECTION_SHEET_PROFILE
@@ -365,6 +367,130 @@ def test_rdl_in_an_unconvertible_unit_is_not_compared() -> None:
     assert rdl_above_guideline_notes([*detected, foreign], {"Benzene": (0.005, None)}) == [
         "BH-02 Benzene at 3 m: detection limit 2 mg/kg not compared with guideline 0.005 mg/L"
         " — mg/kg cannot be converted to mg/L"
+    ]
+
+
+def test_rdl_is_compared_in_the_unit_the_limits_are_in_not_the_checked_rows_main_unit() -> None:
+    # The limits come from every row (off-line holes in mg/L set the main
+    # unit), the check looks at the on-line rows only (mostly ug/L): the
+    # detection limit is converted to the limits' unit, mg/L.
+    every_row = [
+        _reading(0.001, hole="BH-09", unit="mg/L", green_max=0.005),
+        _reading(0.001, hole="BH-10", unit="mg/L"),
+        _reading(0.001, hole="BH-11", unit="mg/L"),
+        _reading(1.0, hole="BH-01", unit="ug/L"),
+    ]
+    limits = workbook_threshold_limits(every_row)
+    assert limits.thresholds == {"Benzene": (0.005, None)}
+    assert limits.units == threshold_units(every_row) == {"benzene": "mg/L"}
+    on_line = [every_row[3], _reading(2.0, detected=False, hole="BH-02", unit="ug/L")]
+    # 2 ug/L = 0.002 mg/L <= 0.005 mg/L: not inconclusive.
+    assert rdl_above_guideline_notes(on_line, limits.thresholds, limits.units) == []
+    on_line_high = [every_row[3], _reading(20.0, detected=False, hole="BH-02", unit="ug/L")]
+    assert rdl_above_guideline_notes(on_line_high, limits.thresholds, limits.units) == [
+        "BH-02 Benzene at 2 m: detection limit 0.02 mg/L exceeds guideline 0.005 mg/L"
+        " — result inconclusive"
+    ]
+
+
+def test_rdl_in_mg_l_is_compared_with_a_ug_l_limit_set_elsewhere() -> None:
+    # Reverse: limits in ug/L (green 5), the checked rows mostly mg/L.
+    on_line = [
+        _reading(0.001, hole="BH-01", unit="mg/L"),
+        _reading(0.01, detected=False, hole="BH-02", unit="mg/L"),
+    ]
+    thresholds = {"Benzene": (5.0, None)}
+    # Spelled differently, and keyed by the parameter name: still ug/L.
+    assert rdl_above_guideline_notes(on_line, thresholds, {"BENZENE": "UG/L"}) == [
+        "BH-02 Benzene at 2 m: detection limit 10 UG/L exceeds guideline 5 UG/L — result inconclusive"
+    ]
+    low = [on_line[0], _reading(0.001, detected=False, hole="BH-02", unit="mg/L")]
+    assert rdl_above_guideline_notes(low, thresholds, {"benzene": "ug/L"}) == []
+
+
+def test_rdl_against_limits_in_another_unit_edge_cases() -> None:
+    thresholds = {"Benzene": (5.0, None)}
+    units = {"benzene": "ug/L"}
+    # No unit on the detection limit: read in the limits' unit.
+    blank = _reading(6.0, detected=False, hole="BH-02", unit="")
+    assert rdl_above_guideline_notes([blank], thresholds, units) == [
+        "BH-02 Benzene at 2 m: detection limit 6 exceeds guideline 5 — result inconclusive"
+    ]
+    # Unconvertible against the limits' unit: not compared, and the note names it.
+    solid = _reading(0.001, detected=False, hole="BH-02", unit="mg/kg")
+    assert rdl_above_guideline_notes([solid], thresholds, units) == [
+        "BH-02 Benzene at 2 m: detection limit 0.001 mg/kg not compared with guideline 5 ug/L"
+        " — mg/kg cannot be converted to ug/L"
+    ]
+    # ppb takes the matrix of the limits' unit: 10 ppb = 10 ug/L > 5 ug/L.
+    ratio = _reading(10.0, detected=False, hole="BH-02", unit="ppb")
+    assert rdl_above_guideline_notes([ratio], thresholds, units) == [
+        "BH-02 Benzene at 2 m: detection limit 10 ug/L exceeds guideline 5 ug/L — result inconclusive"
+    ]
+    # A parameter the units map does not name falls back to the rows' main unit.
+    assert rdl_above_guideline_notes(
+        [_reading(1.0, unit="mg/L"), _reading(0.01, detected=False, hole="BH-02", unit="mg/L")],
+        {"Benzene": (0.005, None)},
+        {"toluene": "ug/L"},
+    ) == [
+        "BH-02 Benzene at 2 m: detection limit 0.01 mg/L exceeds guideline 0.005 mg/L"
+        " — result inconclusive"
+    ]
+
+
+def _validate_rdl_notes(readings: list[EnvironmentalReading]) -> list[str]:
+    holes = ("BH-01", "BH-02", "BH-09", "BH-10", "BH-11")
+    collars = [
+        Collar(hole_id=h, easting=i * 30.0, northing=0.0, elevation=100.0, total_depth=10.0)
+        for i, h in enumerate(holes)
+    ]
+    summary = summarize_environmental_readings(collars, readings, ("BH-01", "BH-02"))
+    return [w for w in summary.warnings if "detection limit" in w]
+
+
+def test_validate_rdl_uses_the_limits_unit_when_off_line_holes_set_it() -> None:
+    # Off-line BH-09..11 in mg/L set the limit (0.005 mg/L) and its unit; the
+    # on-line holes are mostly ug/L. 2 ug/L = 0.002 mg/L is below the limit.
+    readings = [
+        _reading(0.001, hole="BH-09", unit="mg/L", green_max=0.005),
+        _reading(0.001, hole="BH-10", unit="mg/L"),
+        _reading(0.001, hole="BH-11", unit="mg/L"),
+        _reading(1.0, hole="BH-01", unit="ug/L"),
+        _reading(2.0, detected=False, hole="BH-02", unit="ug/L"),
+    ]
+    assert _validate_rdl_notes(readings) == []
+
+
+def test_validate_rdl_reverse_off_line_ug_l_limit_catches_mg_l_non_detect() -> None:
+    readings = [
+        _reading(1.0, hole="BH-09", unit="ug/L", green_max=5.0),
+        _reading(1.0, hole="BH-10", unit="ug/L"),
+        _reading(1.0, hole="BH-11", unit="ug/L"),
+        _reading(0.001, hole="BH-01", unit="mg/L"),
+        _reading(0.01, detected=False, hole="BH-02", unit="mg/L"),
+    ]
+    assert _validate_rdl_notes(readings) == [
+        "BH-02 Benzene at 2 m: detection limit 10 ug/L exceeds guideline 5 ug/L — result inconclusive"
+    ]
+
+
+def test_validate_rdl_uses_the_limits_unit_when_superseded_rows_set_it() -> None:
+    import datetime as dt
+
+    old, new = dt.date(2024, 1, 1), dt.date(2026, 1, 1)
+    readings = [
+        _reading(0.001, hole="BH-01", unit="mg/L", green_max=0.005, date=old),
+        _reading(0.001, hole="BH-02", unit="mg/L", depth=5.0, date=old),
+        _reading(0.001, hole="BH-01", unit="mg/L", depth=5.0, date=old),
+        _reading(1.0, hole="BH-01", unit="ug/L", depth=5.0, date=new),
+        _reading(2.0, detected=False, hole="BH-02", unit="ug/L", depth=5.0, date=new),
+    ]
+    assert _validate_rdl_notes(readings) == []
+    # A detection limit that does exceed it is reported in the limit's unit.
+    readings[-1] = _reading(20.0, detected=False, hole="BH-02", unit="ug/L", depth=5.0, date=new)
+    assert _validate_rdl_notes(readings) == [
+        "BH-02 Benzene at 5 m: detection limit 0.02 mg/L exceeds guideline 0.005 mg/L"
+        " — result inconclusive"
     ]
 
 
