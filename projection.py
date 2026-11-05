@@ -440,7 +440,13 @@ _VERTICAL_INCLINATION_EPS_DEG = 1e-9
 # A dogleg within this of 180° is a reversal: the two tangents are
 # antiparallel, so the plane of the minimum-curvature arc is undefined (only a
 # horizontal 0° → 180° turn can reach it, since inclination is 0–90°).
-_REVERSAL_EPS_RAD = 1e-6
+# Measured: the atan2 step keeps the chord length exact (ΔMD·2/π) all the way to
+# 180°, but the arc's plane follows t1 + t2, whose rounding noise (~1e-16, e.g.
+# cos 90° ≠ 0) tilts it by ~1.2e-16/δ rad for δ = 180° − β. At δ = 1e-10 rad that
+# is ~1e-6 rad (≈0.1 mm on a 100 m semicircle); at 1e-14 rad it is metres. A
+# wider band (1e-6 rad, ≈ 0.00006°) collapsed real near-reversals such as
+# 179.99999° to a point instead of a ~63.66 m semicircle chord.
+_REVERSAL_EPS_RAD = 1e-10
 
 
 def _deg_to_rad(value: float) -> float:
@@ -697,7 +703,8 @@ def densify_survey(stations: Sequence[_SurveyStation]) -> list[_SurveyStation]:
         substeps = min(substeps, _DENSIFY_MAX_SUBSTEPS)
         t_start = _direction_vector(start.inclination_rad, start.azimuth_rad)
         t_end = _direction_vector(end.inclination_rad, end.azimuth_rad)
-        sin_dogleg = math.sin(dogleg)  # ≥ sin(1e-9): reversals were skipped above
+        # ≥ ~1e-10: near-zero doglegs and reversals were skipped above.
+        sin_dogleg = math.sin(dogleg)
         for step in range(1, substeps):
             fraction = step / substeps
             weight_a = math.sin((1.0 - fraction) * dogleg) / sin_dogleg

@@ -897,14 +897,16 @@ def _polygons_for_pair(
                 ),
             ]
             if fence_notes is not None:
-                fence_notes.append(
-                    override_code_change_note(
-                        left_hole_id,
-                        right_hole_id,
-                        left_layer.lithology_code,
-                        right_layer.lithology_code,
-                    )
+                note = override_code_change_note(
+                    left_hole_id,
+                    right_hole_id,
+                    left_layer.lithology_code,
+                    right_layer.lithology_code,
                 )
+                # Two overrides joining the same codes on one pair read the same:
+                # say it once (the pair summary still counts each override).
+                if note not in fence_notes:
+                    fence_notes.append(note)
         for code, top, bottom in pieces:
             polygon = _make_polygon(
                 [*top, *reversed(bottom)],
@@ -1626,9 +1628,10 @@ class CorrelationPairSummary:
     # two holes and was un-matched (drawn as pinch-outs instead); see
     # ``_drop_crossing_matches``.
     crossing_codes: tuple[str, ...] = ()
-    # ``(left_code, right_code)`` for correlation overrides that join units of
-    # different lithology codes. Drawn as a facies change, not a clean match:
-    # excluded from ``matched_count`` and counted as unmatched.
+    # ``(left_code, right_code)`` for each correlation override that joins units
+    # of different lithology codes (repeated when several overrides join the same
+    # codes). Drawn as a facies change, not a clean match: excluded from
+    # ``matched_count`` and each counted as unmatched.
     override_code_changes: tuple[tuple[str, str], ...] = ()
 
     @property
@@ -1779,25 +1782,82 @@ def _collapse_coincident_holes(
     return collapsed
 
 
+def _probe_runs(item: GeologicalPolygon, x: float) -> list[tuple[float, float]]:
+    """``(top, bottom)`` runs where the vertical line at ``x`` meets ``item``."""
+    _min_x, min_z, _max_x, max_z = item.polygon.bounds
+    probe = LineString([(x, min_z - 1.0), (x, max_z + 1.0)])
+    try:
+        hit = item.polygon.intersection(probe)
+    except GEOSException:  # pragma: no cover - defensive
+        hit = _unsnapped(item.polygon).intersection(probe)
+    runs: list[tuple[float, float]] = []
+    for part in getattr(hit, "geoms", [hit]):
+        if part.is_empty or part.geom_type != "LineString":
+            continue
+        zs = [z for _x, z in part.coords]
+        if max(zs) - min(zs) >= MIN_FENCE_THICKNESS_M:
+            runs.append((max(zs), min(zs)))
+    return runs
+
+
+def _uncovered_runs(
+    top: float, bottom: float, covered: Sequence[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Parts of ``top``..``bottom`` outside every ``(top, bottom)`` run in ``covered``."""
+    pieces = [(top, bottom)]
+    for cover_top, cover_bottom in covered:
+        remaining: list[tuple[float, float]] = []
+        for piece_top, piece_bottom in pieces:
+            if cover_bottom >= piece_top or cover_top <= piece_bottom:
+                remaining.append((piece_top, piece_bottom))
+                continue
+            if piece_top > cover_top:
+                remaining.append((piece_top, cover_top))
+            if cover_bottom > piece_bottom:
+                remaining.append((cover_bottom, piece_bottom))
+        pieces = remaining
+    return [piece for piece in pieces if piece[0] - piece[1] >= MIN_FENCE_THICKNESS_M]
+
+
 def _fence_column_at(polygons: list[GeologicalPolygon], x: float) -> list[tuple[str, float, float]]:
     """``(code, top, bottom)`` runs where the vertical line at ``x`` crosses the fence,
-    top-down; touching runs of one code are merged."""
+    top-down; touching runs of one code are merged.
+
+    A polygon whose vertical edge lies on ``x`` (the two halves of a split
+    override fill meet at mid-span; a facies-change tile can end there too) is
+    neither strictly left nor right of the line, so polygons spanning ``x`` were
+    the only ones probed and a column at the edge lost that unit (the caller's
+    gap closing then stretched its neighbours over it). Edge polygons now fill
+    whatever the spanning ones leave uncovered, each depth claimed once: the
+    lithology code sorting first owns a shared edge (independent of transect
+    direction), so the column never stacks both halves.
+    """
     runs: list[tuple[str, float, float]] = []
+    edge_items: list[tuple[GeologicalPolygon, float]] = []
     for item in polygons:
-        min_x, min_z, max_x, max_z = item.polygon.bounds
-        if not (min_x < x < max_x):
+        min_x, _min_z, max_x, _max_z = item.polygon.bounds
+        if min_x < x < max_x:
+            runs.extend((item.lithology_code, top, bottom) for top, bottom in _probe_runs(item, x))
             continue
-        probe = LineString([(x, min_z - 1.0), (x, max_z + 1.0)])
-        try:
-            hit = item.polygon.intersection(probe)
-        except GEOSException:  # pragma: no cover - defensive
-            hit = _unsnapped(item.polygon).intersection(probe)
-        for part in getattr(hit, "geoms", [hit]):
-            if part.is_empty or part.geom_type != "LineString":
-                continue
-            zs = [z for _x, z in part.coords]
-            if max(zs) - min(zs) >= MIN_FENCE_THICKNESS_M:
-                runs.append((item.lithology_code, max(zs), min(zs)))
+        tol = 1e-9 * max(1.0, abs(x))
+        for edge_x in (min_x, max_x):
+            if max_x - min_x > tol and abs(edge_x - x) <= tol:
+                edge_items.append((item, edge_x))
+                break
+    covered = [(top, bottom) for _code, top, bottom in runs]
+    edge_items.sort(
+        key=lambda entry: (
+            entry[0].lithology_code,
+            -entry[0].polygon.bounds[3],
+            entry[0].hole_pair,
+            entry[0].polygon.bounds,
+        )
+    )
+    for item, edge_x in edge_items:
+        for top, bottom in _probe_runs(item, edge_x):
+            for piece in _uncovered_runs(top, bottom, covered):
+                runs.append((item.lithology_code, *piece))
+                covered.append(piece)
     runs.sort(key=lambda run: (-run[1], -run[2]))
     merged: list[tuple[str, float, float]] = []
     for code, top, bottom in runs:
@@ -1964,14 +2024,16 @@ def _correlation_pair_summary(
     right_only: set[str] = set()
     pinch_outs = 0
     crossing: set[str] = set()
-    code_changes: set[tuple[str, str]] = set()
+    # One entry per override (not per code pair): two Clay->Silt overrides on
+    # one pair are two units drawn as facies changes, not one.
+    code_changes: list[tuple[str, str]] = []
     for key, left_layer in left_lookup.items():
         if isinstance(key, tuple) and key and key[0] == "crossed":
             crossing.add(left_layer.lithology_code)
         right_layer = right_lookup.get(key)
         if right_layer is not None:
             if right_layer.lithology_code != left_layer.lithology_code:
-                code_changes.add((left_layer.lithology_code, right_layer.lithology_code))
+                code_changes.append((left_layer.lithology_code, right_layer.lithology_code))
             else:
                 matched += 1
             continue

@@ -11,6 +11,7 @@ from projection import (
     _cumulative_distance,
     _find_closest_segment,
     build_minimum_curvature_survey,
+    densify_survey,
     interpolate_survey_at_depth,
     project_boreholes,
     project_collar_to_transect,
@@ -244,15 +245,59 @@ def test_horizontal_180_degree_turn_adds_no_vertical_depth(caplog) -> None:
 
 @pytest.mark.parametrize("azimuth_deg", [180.0 - 1e-7, 180.0 + 1e-7])
 def test_near_180_degree_horizontal_turn_stays_finite_and_level(azimuth_deg: float) -> None:
-    """acos rounded these doglegs to exactly π and threw the hole ~52 000 km sideways."""
+    """acos rounded these doglegs to exactly π and threw the hole ~52 000 km sideways.
+
+    δ = 1e-7° (≈1.7e-9 rad) is still a defined arc: a level semicircle whose
+    chord is ΔMD·2/π, bending east for 180° − δ and west for 180° + δ.
+    """
     collar = Collar(hole_id="H", easting=0.0, northing=0.0, elevation=500.0, total_depth=10.0)
     readings = [
         DeviationReading(hole_id="H", depth=0.0, inclination_deg=90.0, azimuth_deg=0.0),
         DeviationReading(hole_id="H", depth=10.0, inclination_deg=90.0, azimuth_deg=azimuth_deg),
     ]
     easting, northing, tvd = interpolate_survey_at_depth(build_minimum_curvature_survey(collar, readings), 10.0)
-    assert abs(easting) < 20.0 and abs(northing) < 20.0
-    assert tvd == pytest.approx(0.0, abs=1e-9)
+    assert np.hypot(easting, northing) == pytest.approx(10.0 * 2.0 / np.pi, abs=1e-6)
+    assert np.sign(easting) == (1.0 if azimuth_deg < 180.0 else -1.0)
+    assert abs(northing) < 1e-6
+    assert tvd == pytest.approx(0.0, abs=1e-5)
+
+
+@pytest.mark.parametrize("delta_deg", [1e-4, 1e-5, 1e-6])
+def test_near_180_degree_turn_keeps_semicircle_chord(delta_deg: float) -> None:
+    """Regression: a 1e-6 rad reversal band collapsed 179.99999° (δ ≈ 1.7e-7 rad)
+    to a point while 179.9999° gave the semicircle; the chord is now continuous."""
+    collar = Collar(hole_id="H", easting=0.0, northing=0.0, elevation=500.0, total_depth=100.0)
+    readings = [
+        DeviationReading(hole_id="H", depth=0.0, inclination_deg=90.0, azimuth_deg=0.0),
+        DeviationReading(hole_id="H", depth=100.0, inclination_deg=90.0, azimuth_deg=180.0 - delta_deg),
+    ]
+    stations = build_minimum_curvature_survey(collar, readings)
+    easting, northing, tvd = interpolate_survey_at_depth(stations, 100.0)
+    beta = np.pi - np.radians(delta_deg)
+    chord = 100.0 * np.sin(beta / 2) / (beta / 2)
+    assert np.hypot(easting, northing) == pytest.approx(chord, abs=1e-9)
+    assert easting == pytest.approx(100.0 * 2.0 / np.pi, abs=1e-4)  # 63.662 m semicircle
+    assert northing == pytest.approx(0.0, abs=1e-3)
+    assert tvd == pytest.approx(0.0, abs=1e-6)
+    # The densified arc stays a level (near) half circle of radius ΔMD/β about E = radius.
+    radius = 100.0 / beta
+    for station in densify_survey(stations):
+        assert np.hypot(station.easting - radius, station.northing) == pytest.approx(radius, abs=1e-3)
+        assert station.true_vertical_depth == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("azimuth_deg", [180.0, 180.0 - 1e-12, 180.0 + 1e-12])
+def test_reversal_within_rounding_of_180_stays_finite_and_level(azimuth_deg: float) -> None:
+    """Within ~1e-10 rad of 180° the arc's plane is rounding noise: no offset."""
+    collar = Collar(hole_id="H", easting=0.0, northing=0.0, elevation=500.0, total_depth=10.0)
+    readings = [
+        DeviationReading(hole_id="H", depth=0.0, inclination_deg=90.0, azimuth_deg=0.0),
+        DeviationReading(hole_id="H", depth=10.0, inclination_deg=90.0, azimuth_deg=azimuth_deg),
+    ]
+    stations = build_minimum_curvature_survey(collar, readings)
+    easting, northing, tvd = interpolate_survey_at_depth(stations, 10.0)
+    assert (easting, northing, tvd) == pytest.approx((0.0, 0.0, 0.0), abs=1e-9)
+    assert all(np.isfinite(s.true_vertical_depth) for s in densify_survey(stations))
 
 
 def test_near_180_degree_horizontal_turn_is_a_level_semicircle() -> None:
