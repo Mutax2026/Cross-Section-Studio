@@ -174,7 +174,13 @@ def test_export_metadata_keeps_every_qa_note_for_the_word_pack() -> None:
         overlap_warnings=notes,
     )
     assert payload["qa_notes"] == notes
-    docx = build_figure_docx_bytes(png_bytes=b"", caption="c", title="T", metadata=payload)
+    from PIL import Image
+
+    png = io.BytesIO()
+    Image.new("RGB", (4, 4)).save(png, format="PNG")  # the Word pack refuses an empty PNG
+    docx = build_figure_docx_bytes(
+        png_bytes=png.getvalue(), caption="c", title="T", metadata=payload
+    )
     cells = " ".join(
         cell.text
         for table in Document(io.BytesIO(docx)).tables
