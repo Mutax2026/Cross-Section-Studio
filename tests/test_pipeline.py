@@ -608,10 +608,56 @@ def test_normalize_pdf_pages_fits_every_page_on_letter_landscape() -> None:
     assert "QA notes" in normalized[1][2]
 
 
-def test_override_code_change_note_reaches_configure_preflight() -> None:
-    """Configure shows fence notes by prefix; the override facies note must be one."""
-    from pipeline import FENCE_NOTE_PREFIXES
-    from stratigraphy import OVERRIDE_CODE_CHANGE_PREFIX
+def _override_code_change_section() -> tuple[list[Collar], list[Lithology], list]:
+    """Two holes whose top units (Clay in A, Silt in B) are joined by an override."""
+    from models import CorrelationOverride
 
-    note = f"{OVERRIDE_CODE_CHANGE_PREFIX} BH-01–BH-02: Clay joined to Silt"
-    assert note.startswith(FENCE_NOTE_PREFIXES)
+    collars = [
+        Collar(hole_id="A", easting=0.0, northing=0.0, elevation=100.0, total_depth=20.0),
+        Collar(hole_id="B", easting=50.0, northing=0.0, elevation=100.0, total_depth=20.0),
+    ]
+    lithology = [
+        Lithology(hole_id="A", from_depth=0, to_depth=10, lithology_code="Clay", unit_order=1),
+        Lithology(hole_id="A", from_depth=10, to_depth=20, lithology_code="Sand", unit_order=2),
+        Lithology(hole_id="B", from_depth=0, to_depth=12, lithology_code="Silt", unit_order=1),
+        Lithology(hole_id="B", from_depth=12, to_depth=20, lithology_code="Sand", unit_order=2),
+    ]
+    overrides = [
+        CorrelationOverride(left_hole_id="A", right_hole_id="B", left_unit_order=1, right_unit_order=1)
+    ]
+    return collars, lithology, overrides
+
+
+def test_override_code_change_note_reaches_configure_preflight() -> None:
+    """The real override facies note survives the Configure preflight prefix filter
+    (``app_services.cached_configure_preflight`` keeps ``overlap_warnings`` that
+    start with ``FENCE_NOTE_PREFIXES``)."""
+    import json
+
+    from app_services import cached_configure_preflight
+    from models import ParseResult
+    from pipeline import FENCE_NOTE_PREFIXES, compute_section_geometry
+
+    collars, lithology, overrides = _override_code_change_section()
+    transect = [(-10.0, 0.0), (60.0, 0.0)]
+    geometry = compute_section_geometry(
+        collars, lithology, transect, correlation_overrides=overrides
+    )
+    notes = [
+        message for message in geometry.overlap_warnings if message.startswith(FENCE_NOTE_PREFIXES)
+    ]
+    assert len(notes) == 1
+    for text in ("A", "B", "Clay", "Silt", "facies change"):
+        assert text in notes[0]
+
+    subset = ParseResult(collars=tuple(collars), lithologies=tuple(lithology), errors=())
+    preflight_warnings, summaries = cached_configure_preflight(
+        subset.model_dump_json(),
+        json.dumps(transect),
+        "interpolated",
+        True,
+        json.dumps([override.model_dump(mode="json") for override in overrides]),
+        500.0,
+    )
+    assert notes[0] in preflight_warnings
+    assert summaries[0].override_code_changes == (("Clay", "Silt"),)
