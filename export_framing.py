@@ -479,11 +479,21 @@ def prepare_export_figure(
     apply_viewport_crop(fig, framing)
 
 
+DRAFT_WATERMARK_GID = "draft-watermark"
+
+
 def apply_draft_watermark(fig, framing: ExportFramingConfig | None) -> None:
-    """Overlay a semi-transparent DRAFT stamp on raster/PDF exports."""
+    """Overlay a semi-transparent DRAFT stamp on raster/PDF exports.
+
+    Idempotent: the stamp is tagged with ``DRAFT_WATERMARK_GID`` and not drawn
+    again on a figure that already has it (each export of the same figure used
+    to stack one more DRAFT artist).
+    """
     if framing is None or not framing.show_draft_watermark:
         return
-    fig.text(
+    if any(text.get_gid() == DRAFT_WATERMARK_GID for text in fig.texts):
+        return
+    stamp = fig.text(
         0.5,
         0.5,
         "DRAFT",
@@ -496,6 +506,7 @@ def apply_draft_watermark(fig, framing: ExportFramingConfig | None) -> None:
         transform=fig.transFigure,
         zorder=1000,
     )
+    stamp.set_gid(DRAFT_WATERMARK_GID)
 
 
 # Matplotlib set_gid / SVG id values promoted to Inkscape layers when CAD toggle is on.
