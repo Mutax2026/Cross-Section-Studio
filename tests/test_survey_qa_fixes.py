@@ -16,6 +16,7 @@ import pickle
 import numpy as np
 import pytest
 
+from ai_quality import survey_quality_issues
 from hydro_metrics import head_points_by_group
 from models import Collar, DeviationReading, Lithology, Transect, WaterLevel
 from pipeline import compute_section_geometry
@@ -238,3 +239,76 @@ def test_mining_style_negative_collar_dip_is_converted() -> None:
     )
     tvd = build_along_hole_tvd([dipping], [])["N"]
     assert abs(tvd.tvd_at(40.0) - 40.0 * math.cos(math.radians(30.0))) < 1e-6
+
+
+# --- duplicate measured depths: Validate matches projection -----------------------
+
+
+def _dup_collar() -> Collar:
+    return Collar(hole_id="DUP", easting=0.0, northing=0.0, elevation=100.0, total_depth=20.0)
+
+
+def _duplicate_issues(readings: list[DeviationReading]) -> list:
+    issues = survey_quality_issues([_dup_collar()], readings)
+    return [issue for issue in issues if issue.code == "duplicate_survey_depth"]
+
+
+def test_conflicting_duplicate_survey_depth_is_a_validate_warning() -> None:
+    readings = [
+        DeviationReading(hole_id="DUP", depth=10.0, inclination_deg=80.0, azimuth_deg=45.0),
+        DeviationReading(hole_id="DUP", depth=10.0, inclination_deg=10.0, azimuth_deg=0.0),
+        DeviationReading(hole_id="DUP", depth=15.0, inclination_deg=10.0, azimuth_deg=0.0),
+    ]
+    issues = _duplicate_issues(readings)
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue.severity == "warning" and issue.hole_id == "DUP"
+    assert issue.message.startswith("DUP: 2 Deviations rows at 10 m disagree")
+    assert "80°/45°" in issue.message and "10°/0°" in issue.message
+    assert "draws inclination 10°, azimuth 0°" in issue.message
+    # Row order does not change the verdict.
+    assert len(_duplicate_issues(list(reversed(readings)))) == 1
+
+
+def test_identical_duplicate_survey_rows_are_not_flagged() -> None:
+    readings = [
+        DeviationReading(hole_id="DUP", depth=10.0, inclination_deg=30.0, azimuth_deg=0.0),
+        DeviationReading(hole_id="DUP", depth=10.0, inclination_deg=30.0, azimuth_deg=360.0),
+        DeviationReading(hole_id="DUP", depth=15.0, inclination_deg=0.0, azimuth_deg=90.0),
+        DeviationReading(hole_id="DUP", depth=15.0, inclination_deg=0.0, azimuth_deg=270.0),
+        # −90 mining dip is straight down, same as 0.
+        DeviationReading(hole_id="DUP", depth=18.0, inclination_deg=-90.0, azimuth_deg=0.0),
+        DeviationReading(hole_id="DUP", depth=18.0, inclination_deg=0.0, azimuth_deg=120.0),
+    ]
+    assert _duplicate_issues(readings) == []
+
+
+def test_orphan_duplicate_survey_rows_are_left_to_the_orphan_warning() -> None:
+    readings = [
+        DeviationReading(hole_id="GHOST", depth=5.0, inclination_deg=0.0, azimuth_deg=0.0),
+        DeviationReading(hole_id="GHOST", depth=5.0, inclination_deg=40.0, azimuth_deg=0.0),
+    ]
+    codes = [issue.code for issue in survey_quality_issues([_dup_collar()], readings)]
+    assert codes == ["orphan_deviations"]
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [
+        ((10.0, 0.0), (80.0, 0.0)),
+        ((30.0, 0.0), (30.0, 360.0)),
+        ((0.0, 90.0), (0.0, 270.0)),
+        ((-60.0, 0.0), (30.0, 0.0)),
+        ((-60.0, 0.0), (60.0, 0.0)),
+        ((20.0, 10.0), (20.0, 10.000001)),
+        ((45.0, 0.0), (45.0, 180.0)),
+    ],
+)
+def test_duplicate_survey_warning_matches_projection(pair, caplog) -> None:
+    readings = [
+        DeviationReading(hole_id="DUP", depth=10.0, inclination_deg=inc, azimuth_deg=azi) for inc, azi in pair
+    ]
+    with caplog.at_level("WARNING", logger="projection"):
+        build_minimum_curvature_survey(_dup_collar(), readings)
+    projection_warned = any("disagree" in record.getMessage() for record in caplog.records)
+    assert bool(_duplicate_issues(readings)) == projection_warned

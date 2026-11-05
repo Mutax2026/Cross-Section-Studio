@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -640,11 +641,65 @@ def _horizontal_hole_issue(hole_id: str, where: str) -> QualityIssue:
     )
 
 
+def _survey_inclination_from_vertical(inc_deg: float) -> float:
+    """Mirror of ``projection._inclination_from_vertical`` (−90 mining dip = straight down)."""
+    return 90.0 + inc_deg if -90.0 <= inc_deg < 0.0 else inc_deg
+
+
+def _survey_tangent(reading: DeviationReading) -> tuple[float, float, float]:
+    """Unit hole direction (north, east, down), as ``projection._reading_tangent``."""
+    inc = math.radians(_survey_inclination_from_vertical(reading.inclination_deg))
+    azi = math.radians(reading.azimuth_deg)
+    return math.sin(inc) * math.cos(azi), math.sin(inc) * math.sin(azi), math.cos(inc)
+
+
+# Same threshold as ``projection._one_reading_per_depth``: rows closer than this
+# point the same way (azimuth 0 vs 360, any azimuth on a vertical shot) and
+# collapse silently there, so Validate stays quiet about them too.
+_SAME_SURVEY_DIRECTION_TOL = 1e-9
+
+
+def _duplicate_survey_depth_issues(hole_id: str, readings: Sequence[DeviationReading]) -> list[QualityIssue]:
+    """Deviations rows at one depth that disagree (projection keeps the most vertical)."""
+    by_depth: dict[float, list[DeviationReading]] = {}
+    for reading in readings:
+        by_depth.setdefault(reading.depth, []).append(reading)
+    issues: list[QualityIssue] = []
+    for depth in sorted(by_depth):
+        group = by_depth[depth]
+        if len(group) < 2:
+            continue
+        # Same winner as projection: smallest inclination from vertical, then azimuth.
+        drawn = min(
+            group,
+            key=lambda r: (_survey_inclination_from_vertical(r.inclination_deg), r.azimuth_deg % 360.0),
+        )
+        drawn_tangent = _survey_tangent(drawn)
+        if all(math.dist(_survey_tangent(r), drawn_tangent) <= _SAME_SURVEY_DIRECTION_TOL for r in group):
+            continue
+        shown = "; ".join(f"{r.inclination_deg:g}°/{r.azimuth_deg:g}°" for r in group)
+        issues.append(
+            QualityIssue(
+                code="duplicate_survey_depth",
+                message=(
+                    f"{hole_id}: {len(group)} Deviations rows at {_m(depth)} m disagree "
+                    f"(inclination/azimuth {shown}) — the section draws inclination "
+                    f"{drawn.inclination_deg:g}°, azimuth {drawn.azimuth_deg:g}° (closest to "
+                    "vertical); keep one row per depth"
+                ),
+                severity=Severity.WARNING.value,
+                hole_id=hole_id,
+            )
+        )
+    return issues
+
+
 def survey_quality_issues(
     collars: Sequence[Collar],
     deviation_readings: Sequence[DeviationReading] | None,
 ) -> list[QualityIssue]:
-    """Horizontal (90°) holes / survey stations and Deviations rows with no collar."""
+    """Horizontal (90°) holes / survey stations, conflicting rows at one depth, and
+    Deviations rows with no collar."""
     issues: list[QualityIssue] = []
     collar_ids = {collar.hole_id for collar in collars}
     for collar in collars:
@@ -652,16 +707,20 @@ def survey_quality_issues(
         if collar.inclination_deg == 90.0:
             issues.append(_horizontal_hole_issue(collar.hole_id, "on Collars"))
     horizontal: dict[str, list[float]] = {}
+    by_hole: dict[str, list[DeviationReading]] = {}
     orphans: dict[str, int] = {}
     for reading in deviation_readings or ():
         if reading.hole_id not in collar_ids:
             orphans[reading.hole_id] = orphans.get(reading.hole_id, 0) + 1
             continue
+        by_hole.setdefault(reading.hole_id, []).append(reading)
         if reading.inclination_deg == 90.0:
             horizontal.setdefault(reading.hole_id, []).append(reading.depth)
     for hole_id, depths in horizontal.items():
         shown = ", ".join(f"{_m(depth)} m" for depth in sorted(depths)[:5])
         issues.append(_horizontal_hole_issue(hole_id, f"on Deviations at {shown}"))
+    for hole_id, hole_readings in by_hole.items():
+        issues.extend(_duplicate_survey_depth_issues(hole_id, hole_readings))
     if orphans:
         listed = ", ".join(f"{hole} ({count})" for hole, count in sorted(orphans.items()))
         issues.append(
