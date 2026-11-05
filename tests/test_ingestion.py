@@ -1510,7 +1510,7 @@ def test_field_export_every_row_bad_returns_errors_not_a_crash() -> None:
 
 
 def test_export_platform_workbook_refuses_to_drop_bad_rows(tmp_path: Path) -> None:
-    raw = _field_export_bytes([_lith_row("BH-01", "0-2 m"), _lith_row("BH-01", "2-4 m-ish")])
+    raw = _field_export_bytes([_lith_row("BH-01", "0-2 m"), _lith_row("BH-01", "2-4-6 m")])
     output = tmp_path / "platform.xlsx"
     with pytest.raises(ValueError, match=r"(?s)1 lithology row\(s\) could not be read.*Lithology row 3"):
         export_platform_workbook(BytesIO(raw), output, profile_id="field_export_v1")
