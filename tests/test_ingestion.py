@@ -1283,6 +1283,42 @@ def test_lookalike_tab_without_hole_rows_is_not_flagged() -> None:
     assert not result.errors
 
 
+@pytest.mark.parametrize(
+    ("sheet", "rows"),
+    [
+        ("Water Quality", [{"hole_id": "BH1", "parameter": "Chloride", "value": 10, "unit": "mg/L"}]),
+        ("Groundwater Chemistry", [{"hole_id": "BH1", "Analyte": "Sodium", "Result": 1}]),
+        ("Surface Water", [{"hole_id": "BH1", "sample": "SW1"}]),
+        ("Water chemistry", [{"hole_id": "BH1", "depth": 3, "chloride": 120}]),
+        ("Groundwater Results", [{"hole_id": "BH1", "depth": 3, "parameter": "pH", "value": 7}]),
+        ("Screening Notes", [{"hole_id": "BH1", "note": "a"}]),
+        ("Well Screen Notes", [{"hole_id": "BH1", "note": "slot 10"}]),
+    ],
+)
+def test_chemistry_and_note_tabs_are_not_flagged_as_misnamed(sheet: str, rows: list[dict]) -> None:
+    """Review: lab tabs with hole_id/parameter/value rows were reported as misnamed
+    Water sheets; only tabs whose headers look like water levels / screen depths are."""
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, {sheet: rows}))
+    assert not [e for e in result.errors if "was not read" in e], result.errors
+
+
+@pytest.mark.parametrize(
+    ("sheet", "rows", "target"),
+    [
+        ("Water Levels", [{"hole_id": "BH1", "water_level_m": 3}], "Water"),
+        ("Groundwater Elevations", [{"hole_id": "BH1", "elevation_masl": 97}], "Water"),
+        ("Well Screen Details", [{"hole_id": "BH1", "top": 1, "bottom": 4}], "Screens"),
+        ("Screen Intervals", [{"hole_id": "BH1", "from": 1, "to": 4}], "Screens"),
+    ],
+)
+def test_misnamed_tabs_with_level_or_depth_headers_are_still_flagged(
+    sheet: str, rows: list[dict], target: str
+) -> None:
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, {sheet: rows}))
+    matches = [e for e in result.errors if f"The '{sheet}' sheet was not read" in e]
+    assert len(matches) == 1 and f"rename the tab to {target}" in matches[0], result.errors
+
+
 @pytest.mark.parametrize("sheet", ["Faults", "Unconformities"])
 @pytest.mark.parametrize(
     ("x_profile", "elevation", "expected"),
