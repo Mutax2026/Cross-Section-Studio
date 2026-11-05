@@ -124,6 +124,12 @@ def read_workbook_rows(path: Path = WORKBOOK) -> list[dict[str, object]]:
         raw_hex = str(hex_cell.value or "").strip()
         colour = _hex(raw_hex)
         if raw_hex and colour is None:
+            if not name:
+                # A spacer row ("—" or a note in column F, no lithology).
+                # It ends the group above, so a named row below it with a
+                # blank column F fails loudly instead of inheriting a colour.
+                group_colour = None
+                continue
             # A typo here would otherwise read as "blank" and inherit the
             # group colour above, shipping the wrong colour without a word.
             raise ValueError(f"row {hex_cell.row}: column F {raw_hex!r} is not a #RRGGBB hex")
