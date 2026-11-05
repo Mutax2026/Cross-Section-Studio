@@ -388,6 +388,149 @@ def test_correlation_override_joining_same_code_stays_one_fill() -> None:
     assert summaries[0].match_rate == pytest.approx(1.0)
 
 
+def test_two_overrides_joining_same_codes_count_separately_with_one_note() -> None:
+    """Regression: code changes were a set of code pairs, so two Clay->Silt
+    overrides on one pair counted as one unmatched unit (rate 0.67, not 0.50) and
+    each emitted the same note."""
+    projected = _ordered_rows_df(
+        [
+            ("A", 0.0, 100.0, 90.0, "Clay", 1),
+            ("A", 0.0, 90.0, 85.0, "Sand", 2),
+            ("A", 0.0, 85.0, 80.0, "Clay", 3),
+            ("A", 0.0, 80.0, 70.0, "Till", 4),
+            ("B", 50.0, 100.0, 90.0, "Silt", 1),
+            ("B", 50.0, 90.0, 85.0, "Sand", 2),
+            ("B", 50.0, 85.0, 80.0, "Silt", 3),
+            ("B", 50.0, 80.0, 70.0, "Till", 4),
+        ]
+    )
+    overrides = tuple(
+        CorrelationOverride(
+            left_hole_id="A", right_hole_id="B", left_unit_order=order, right_unit_order=order
+        )
+        for order in (1, 3)
+    )
+    summaries: list = []
+    notes: list[str] = []
+    polygons = build_stratigraphy(
+        projected,
+        allow_pinch_outs=True,
+        correlation_overrides=overrides,
+        pair_summaries=summaries,
+        clip_warnings=notes,
+    )
+    assert len(notes) == 1
+    assert "Clay in A is joined to Silt in B" in notes[0]
+    for summary in (
+        summaries[0],
+        preview_correlation_health(projected, correlation_overrides=overrides)[0],
+    ):
+        assert summary.matched_count == 2  # Sand, Till
+        assert summary.override_code_changes == (("Clay", "Silt"), ("Clay", "Silt"))
+        assert summary.unmatched_keys_count == 2
+        assert summary.match_rate == pytest.approx(0.5)
+    assert detect_polygon_overlaps(polygons) == []
+    assert sum(p.polygon.area for p in polygons) == pytest.approx(30.0 * 50.0)
+
+
+def _split_override_short_middle(x_mid_hole: float, *, reverse: bool = False) -> pd.DataFrame:
+    """L and R joined by an override from Sand (L) to Gravel (R) on a 0..100 fence,
+    with a short hole M (Clay, Sand to 80 m) at ``x_mid_hole``."""
+    rows = [
+        ("L", 0.0, 100.0, 90.0, "Clay", 1),
+        ("L", 0.0, 90.0, 60.0, "Sand", 2),
+        ("L", 0.0, 60.0, 40.0, "Till", 3),
+        ("M", x_mid_hole, 100.0, 90.0, "Clay", 1),
+        ("M", x_mid_hole, 90.0, 80.0, "Sand", 2),
+        ("R", 100.0, 100.0, 90.0, "Clay", 1),
+        ("R", 100.0, 90.0, 60.0, "Gravel", 2),
+        ("R", 100.0, 60.0, 40.0, "Till", 3),
+    ]
+    if reverse:
+        rows = [(hole, 100.0 - x, *rest) for hole, x, *rest in rows]
+    return _ordered_rows_df(rows)
+
+
+_SPLIT_OVERRIDE = (
+    CorrelationOverride(left_hole_id="L", right_hole_id="R", left_unit_order=2, right_unit_order=2),
+)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("x_mid_hole", [49.0, 50.0, 51.0])
+def test_short_hole_at_split_override_mid_span_keeps_contact(
+    x_mid_hole: float, reverse: bool
+) -> None:
+    """Regression: the two halves of a split override fill meet at mid-span and
+    the column probe skipped polygons whose edge lies on the line, so a short
+    hole exactly at mid-span lost the unit below its TD and gap closing stretched
+    the Till up to 70 m. The contact stays at 60 m, as either side of mid-span."""
+    from stratigraphy import _correlation_overrides_by_pair, _fence_hole_profiles
+
+    projected = _split_override_short_middle(x_mid_hole, reverse=reverse)
+    profiles = _fence_hole_profiles(
+        projected,
+        allow_pinch_outs=True,
+        override_index=_correlation_overrides_by_pair(_SPLIT_OVERRIDE),
+    )
+    middle = next(intervals for _x, hole, intervals, _lookup in profiles if hole == "M")
+    column = [(i.lithology_code, i.top_elevation, i.bottom_elevation) for i in middle]
+    till = [(top, bottom) for code, top, bottom in column if code == "Till"]
+    assert till == [(pytest.approx(60.0), pytest.approx(40.0))]
+    # Logged Sand kept to 80 m; between it and the Till exactly one unit at every
+    # depth (Sand extended or the Gravel half beyond mid-span, never both).
+    sand = next((top, bottom) for code, top, bottom in column if code == "Sand")
+    assert sand[0] == pytest.approx(90.0) and sand[1] <= 80.0 + 1e-6
+    assert column[0][1] == pytest.approx(100.0) and column[-1][2] == pytest.approx(40.0)
+    for (_c0, _t0, bottom), (_c1, top, _b1) in zip(column, column[1:]):
+        assert top == pytest.approx(bottom)
+
+    polygons = build_stratigraphy(projected, correlation_overrides=_SPLIT_OVERRIDE)
+    assert detect_polygon_overlaps(polygons) == []
+    assert sum(p.polygon.area for p in polygons) == pytest.approx(60.0 * 100.0)
+
+
+def test_short_hole_at_split_override_mid_span_is_direction_independent() -> None:
+    from stratigraphy import _correlation_overrides_by_pair, _fence_hole_profiles
+
+    columns = []
+    for reverse in (False, True):
+        profiles = _fence_hole_profiles(
+            _split_override_short_middle(50.0, reverse=reverse),
+            allow_pinch_outs=True,
+            override_index=_correlation_overrides_by_pair(_SPLIT_OVERRIDE),
+        )
+        middle = next(intervals for _x, hole, intervals, _lookup in profiles if hole == "M")
+        columns.append([(i.lithology_code, i.top_elevation, i.bottom_elevation) for i in middle])
+    assert columns[0] == columns[1]
+
+
+def test_fence_column_at_shared_edge_claims_each_depth_once() -> None:
+    from stratigraphy import _fence_column_at
+
+    left = GeologicalPolygon(
+        polygon=ShapelyPolygon([(0, 10), (5, 10), (5, 0), (0, 0)]),
+        lithology_code="Sand",
+        hole_pair=("L", "R"),
+    )
+    right = GeologicalPolygon(
+        polygon=ShapelyPolygon([(5, 12), (10, 12), (10, 0), (5, 0)]),
+        lithology_code="Gravel",
+        hole_pair=("L", "R"),
+    )
+    spanning = GeologicalPolygon(
+        polygon=ShapelyPolygon([(0, 0), (10, 0), (10, -5), (0, -5)]),
+        lithology_code="Till",
+        hole_pair=("L", "R"),
+    )
+    column = _fence_column_at([left, right, spanning], 5.0)
+    assert column == [("Gravel", 12.0, 0.0), ("Till", 0.0, -5.0)]
+    assert _fence_column_at([left, right, spanning], 4.0) == [
+        ("Sand", 10.0, 0.0),
+        ("Till", 0.0, -5.0),
+    ]
+
+
 def test_correlation_override_accepts_reversed_hole_order() -> None:
     projected = pd.DataFrame(
         [
