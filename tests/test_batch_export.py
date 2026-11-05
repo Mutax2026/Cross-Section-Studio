@@ -340,8 +340,9 @@ def test_batch_zip_never_reuses_the_binder_name() -> None:
 
 def test_word_export_accepts_very_long_titles() -> None:
     from docx_export import build_figure_docx_bytes
+    from tests.test_docx_export import tiny_png
 
-    assert build_figure_docx_bytes(png_bytes=b"", caption="c", title="A" * 300)
+    assert build_figure_docx_bytes(png_bytes=tiny_png(), caption="c", title="A" * 300)
 
 
 def test_batch_title_swaps_every_occurrence_of_a_single_letter_label() -> None:
