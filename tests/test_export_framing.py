@@ -6,6 +6,8 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 
+import pytest
+
 from export_framing import (
     ExportFramingConfig,
     annotate_svg_layers,
@@ -349,3 +351,57 @@ def test_reserved_and_typographic_names_are_safe_and_distinct() -> None:
     # One policy everywhere: no quote characters in any file name.
     assert build_export_filename(pattern="section_title", section_title="B-B'") == "B-B"
     assert build_export_filename(pattern="section_title", section_title="O'Hara pit") == "OHara_pit"
+
+
+@pytest.mark.parametrize(
+    "reserved",
+    ["COM0", "LPT0", "com0", "lpt0", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "lpt³", "AUX", "PRN", "COM9"],
+)
+def test_every_windows_device_name_is_suffixed(reserved: str) -> None:
+    from export_framing import build_export_filename, sanitize_filename_stem
+
+    assert sanitize_filename_stem(reserved) == f"{reserved}_"
+    assert build_export_filename(pattern="section_title", section_title=reserved) == f"{reserved}_"
+
+
+@pytest.mark.parametrize("name", ["COM10", "LPT⁴", "COM⁰", "CONSOLE", "COM", "LPT", "COM0X", "XCOM0"])
+def test_names_that_only_look_like_devices_are_kept(name: str) -> None:
+    from export_framing import avoid_windows_reserved_name, sanitize_filename_stem
+
+    assert sanitize_filename_stem(name) == name
+    assert avoid_windows_reserved_name(name) == name
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("LPT0 ", "LPT0_"), ("LPT0.", "LPT0_"), ("COM0. ", "COM0_"), (" com0 ", "com0_"), ("CON ", "CON_")],
+)
+def test_reserved_names_with_trailing_dot_or_space_are_suffixed(text: str, expected: str) -> None:
+    from export_framing import sanitize_filename_stem
+
+    assert sanitize_filename_stem(text) == expected
+
+
+def test_dotted_reserved_stem_becomes_a_plain_name() -> None:
+    from export_framing import sanitize_filename_stem
+
+    # The dot is not file-name safe, so "com0.tar" is no longer a device name.
+    assert sanitize_filename_stem("com0.tar") == "com0_tar"
+    assert sanitize_filename_stem("CON.tar") == "CON_tar"
+
+
+@pytest.mark.parametrize(
+    ("stem", "expected"),
+    [
+        ("com0.tar", "com0_.tar"),
+        ("CON.tar", "CON_.tar"),
+        ("LPT0 ", "LPT0_ "),
+        ("LPT¹ .svg", "LPT¹_ .svg"),
+        ("COM0", "COM0_"),
+        ("report.COM0", "report.COM0"),
+    ],
+)
+def test_avoid_windows_reserved_name_matches_the_part_before_the_first_dot(stem: str, expected: str) -> None:
+    from export_framing import avoid_windows_reserved_name
+
+    assert avoid_windows_reserved_name(stem) == expected
