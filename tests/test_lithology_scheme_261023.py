@@ -134,6 +134,59 @@ def test_workbook_with_a_conflicting_cell_fill_is_rejected(tmp_path: Path) -> No
         build_lithology_legend.build_scheme(broken)
 
 
+def test_workbook_with_a_malformed_hex_is_rejected_not_inherited(tmp_path: Path) -> None:
+    """A typo in column F must not read as blank and take the colour above."""
+    import openpyxl
+
+    book = openpyxl.load_workbook(bh_log_lithology_legend_xlsx_path())
+    sheet = book.worksheets[0]
+    sheet["F4"].value = "#96725"  # Clay group head (F is merged down the group): five digits
+    broken = tmp_path / "legend.xlsx"
+    book.save(broken)
+    with pytest.raises(ValueError, match=r"row 4: column F '#96725' is not a #RRGGBB hex"):
+        build_lithology_legend.build_scheme(broken)
+
+
+def test_workbook_spacer_row_is_skipped_and_ends_the_group(tmp_path: Path) -> None:
+    """A dash in column F with no lithology is a spacer, not a broken colour.
+
+    It must not abort the build, and a named row under it with a blank
+    column F must not inherit the colour of the group above the spacer.
+    """
+    import openpyxl
+
+    book = openpyxl.load_workbook(bh_log_lithology_legend_xlsx_path())
+    sheet = book.worksheets[0]
+    spacer = sheet.max_row + 1
+    sheet.cell(row=spacer, column=6).value = "—"
+    with_spacer = tmp_path / "spacer.xlsx"
+    book.save(with_spacer)
+    def styles(path: Path) -> dict[str, tuple[object, object]]:
+        scheme = build_lithology_legend.build_scheme(path)
+        return {name: (e["color"], e["hatch"]) for name, e in scheme["lithologies"].items()}
+
+    assert styles(with_spacer) == styles(bh_log_lithology_legend_xlsx_path())
+
+    sheet.cell(row=spacer + 1, column=8).value = "Orphan Unit"
+    orphan = tmp_path / "orphan.xlsx"
+    book.save(orphan)
+    with pytest.raises(ValueError, match="'Orphan Unit'.*has no group colour above it"):
+        build_lithology_legend.build_scheme(orphan)
+
+
+def test_workbook_with_a_duplicated_lithology_is_rejected(tmp_path: Path) -> None:
+    """A row pasted twice must fail the build rather than let the lower row win."""
+    import openpyxl
+
+    book = openpyxl.load_workbook(bh_log_lithology_legend_xlsx_path())
+    sheet = book.worksheets[0]
+    sheet["H5"].value = "Clay"  # Sandy Clay row renamed to the row above
+    broken = tmp_path / "legend.xlsx"
+    book.save(broken)
+    with pytest.raises(ValueError, match="'Clay' \(row 5\) is listed twice"):
+        build_lithology_legend.build_scheme(broken)
+
+
 def test_legacy_codes_keep_their_styles_but_stay_off_the_legend() -> None:
     payload = json.loads(bh_log_lithology_legend_path().read_text(encoding="utf-8"))
     legacy = payload["legacy_codes"]
