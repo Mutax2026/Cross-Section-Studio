@@ -230,6 +230,8 @@ def _ellipsize(text: str, width_in: float, measure) -> str:
 
 
 _MBGS_NOTE = "mbgs DENOTES METRES BELOW GROUND SURFACE."
+# Same warning the section sheet prints in its metadata footer.
+PLACEHOLDER_ELEVATION_NOTE = "WARNING: PLACEHOLDER COLLAR ELEVATION."
 
 
 def _is_masl_note(note: str) -> bool:
@@ -731,6 +733,18 @@ class ConsultingLayoutMixin:
         ):
             title_block = title_block.model_copy(
                 update={"notes": (*title_block.notes, self.disclaimer)}
+            )
+        meta = getattr(self, "figure_metadata", None)
+        if (
+            meta is not None
+            and meta.uses_placeholder_elevation
+            and PLACEHOLDER_ELEVATION_NOTE not in title_block.notes
+        ):
+            # The section sheet prints this in its metadata footer; the
+            # consulting sheet has no such footer, so it leads the notes (only
+            # the first few notes are drawn, and this one must not be cut).
+            title_block = title_block.model_copy(
+                update={"notes": (PLACEHOLDER_ELEVATION_NOTE, *title_block.notes)}
             )
 
         ctx = self._hole_context(projected_df)

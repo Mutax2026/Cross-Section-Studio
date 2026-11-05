@@ -45,7 +45,13 @@ def build_figure_docx_bytes(
     title: str,
     metadata: Mapping[str, object] | None = None,
 ) -> bytes:
-    """Embed prepared PNG with caption and optional metadata table."""
+    """Embed prepared PNG with caption and optional metadata table.
+
+    Raises ``ValueError`` when ``png_bytes`` is empty: a figure pack without
+    its figure is not a deliverable (the app reports "Word file not made").
+    """
+    if not png_bytes:
+        raise ValueError("no figure image (PNG) to put in the Word file")
     try:
         from docx import Document
         from docx.shared import Inches
@@ -67,9 +73,7 @@ def build_figure_docx_bytes(
     document.add_heading(title or "Cross Section", level=1)
     if caption:
         document.add_paragraph(caption)
-    if png_bytes:
-        stream = BytesIO(png_bytes)
-        document.add_picture(stream, width=Inches(6.5))
+    document.add_picture(BytesIO(png_bytes), width=Inches(6.5))
     if metadata:
         document.add_heading("Figure metadata", level=2)
         table = document.add_table(rows=1, cols=2)

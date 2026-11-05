@@ -100,8 +100,10 @@ def test_word_and_zip_deliverables_carry_attribution() -> None:
     from docx_export import build_figure_docx_bytes
     from export_framing import _default_readme
 
+    from tests.test_docx_export import tiny_png
+
     docx_bytes = build_figure_docx_bytes(
-        title="Section A-A'", caption="", png_bytes=b"", metadata={}
+        title="Section A-A'", caption="", png_bytes=tiny_png(), metadata={}
     )
     props = Document(io.BytesIO(docx_bytes)).core_properties
     assert props.author == "Andrew Liu, Ecoventure"
