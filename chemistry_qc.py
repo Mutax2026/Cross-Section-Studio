@@ -495,6 +495,20 @@ def rdl_above_guideline_note(reading: object, green_max: float) -> str:
     )
 
 
+def rdl_unconvertible_note(reading: object, green_max: float, main_unit: str) -> str:
+    """``"BH-2 Benzene at 3 m: detection limit 2 mg/kg not compared with guideline 0.005 mg/L —
+    mg/kg cannot be converted to mg/L"``."""
+    unit = str(getattr(reading, "unit", "") or "").strip()
+    hole_id = getattr(reading, "hole_id", "")
+    parameter = getattr(reading, "parameter", "")
+    depth = float(getattr(reading, "sample_depth"))
+    return (
+        f"{hole_id} {parameter} at {depth:g} m: detection limit "
+        f"{_with_unit(getattr(reading, 'value'), unit)} not compared with guideline "
+        f"{_with_unit(green_max, main_unit)} — {unit} cannot be converted to {main_unit}"
+    )
+
+
 def rdl_above_guideline_notes(
     readings: Iterable[object],
     thresholds: Mapping[str, ChemistryThresholdPair] | None,
@@ -504,13 +518,25 @@ def rdl_above_guideline_notes(
     Only parameters with an explicit green limit in ``thresholds`` are checked
     (Validate uses the workbook ``green_max`` values; the figure resolves its
     own limits per parameter and calls :func:`rdl_above_guideline_note`).
+    Limits are in the parameter's main unit (see the module docstring), so
+    each detection limit is first converted to that unit with
+    :func:`harmonize_units` (as the figure does) and the note prints both
+    numbers in it. A detection limit whose unit cannot be converted is not
+    compared; its note says so (:func:`rdl_unconvertible_note`).
     """
+    harmonized = harmonize_units(readings)
     notes: list[str] = []
-    for reading in readings:
-        green_max, _orange = chemistry_threshold_pair_for(
-            str(getattr(reading, "parameter", "")), thresholds
-        )
-        if rdl_exceeds_guideline(reading, green_max):
-            assert green_max is not None
+    for reading in harmonized.readings:
+        if getattr(reading, "detected", True):
+            continue
+        parameter = str(getattr(reading, "parameter", ""))
+        green_max, _orange = chemistry_threshold_pair_for(parameter, thresholds)
+        if green_max is None:
+            continue
+        if harmonized.is_unconverted(reading):
+            notes.append(
+                rdl_unconvertible_note(reading, green_max, harmonized.dominant_unit_for(parameter))
+            )
+        elif rdl_exceeds_guideline(reading, green_max):
             notes.append(rdl_above_guideline_note(reading, green_max))
     return notes
