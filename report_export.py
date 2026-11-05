@@ -12,7 +12,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 
 from app_identity import APP_NAME, AUTHOR, COPYRIGHT_NOTICE, ORGANIZATION
-from export_framing import PAGE_FIGSIZE_IN
+from export_framing import PAGE_FIGSIZE_IN, ExportFramingConfig, apply_draft_watermark
 from renderer import CrossSectionRenderer
 from stratigraphy import GeologicalPolygon
 
@@ -111,9 +111,15 @@ def _text_pages_pdf(
     blocks: Sequence[tuple[str, float, dict[str, object], float]],
     *,
     page_size_in: tuple[float, float] = LETTER_LANDSCAPE_IN,
+    export_framing: ExportFramingConfig | None = None,
 ) -> bytes:
     """Lay out ``(text, fontsize, text kwargs, indent_in)`` blocks top-down on
-    fixed-size pages, wrapping long lines and starting new pages as needed."""
+    fixed-size pages, wrapping long lines and starting new pages as needed.
+
+    Each page gets the same DRAFT stamp as the figure page when
+    ``export_framing.show_draft_watermark`` is on, so no page of a draft PDF
+    reads as final.
+    """
     width_in, height_in = page_size_in
     buffer = BytesIO()
     with PdfPages(buffer) as pdf:
@@ -126,13 +132,17 @@ def _text_pages_pdf(
             y_in = height_in - _PAGE_MARGIN_IN
             return page
 
+        def save_page(page: Figure) -> None:
+            apply_draft_watermark(page, export_framing)
+            pdf.savefig(page)
+
         fig = new_page()
         for text, fontsize, kwargs, indent_in in blocks:
             line_in = fontsize * 1.35 / 72.0
             usable = width_in - 2 * _PAGE_MARGIN_IN - indent_in
             for line in _wrap(text, fontsize=fontsize, width_in=usable):
                 if y_in - line_in < _PAGE_MARGIN_IN:
-                    pdf.savefig(fig)
+                    save_page(fig)
                     fig = new_page()
                 fig.text(
                     (_PAGE_MARGIN_IN + indent_in) / width_in,
@@ -145,8 +155,13 @@ def _text_pages_pdf(
                 )
                 y_in -= line_in
             y_in -= line_in * 0.35
-        pdf.savefig(fig)
+        save_page(fig)
     return buffer.getvalue()
+
+
+def _renderer_framing(renderer: CrossSectionRenderer) -> ExportFramingConfig | None:
+    """The figure page's export framing (DRAFT flag), so text pages match it."""
+    return getattr(renderer, "export_framing", None)
 
 
 def _bullets(lines: Sequence[str], *, fontsize: float = 9.0) -> list[tuple[str, float, dict[str, object], float]]:
@@ -176,7 +191,9 @@ def build_report_summary_pdf(
     if qa_lines:
         blocks.append(("QA notes:", 10.0, bold, 0.0))
         blocks.extend(_bullets(list(qa_lines), fontsize=8.5))
-    return _text_pages_pdf(blocks, page_size_in=page_size_in)
+    return _text_pages_pdf(
+        blocks, page_size_in=page_size_in, export_framing=_renderer_framing(renderer)
+    )
 
 
 def build_qa_notes_pdf(
@@ -199,7 +216,9 @@ def build_qa_notes_pdf(
         ),
     ]
     blocks.extend(_bullets(list(qa_lines)))
-    return _text_pages_pdf(blocks, page_size_in=page_size_in)
+    return _text_pages_pdf(
+        blocks, page_size_in=page_size_in, export_framing=_renderer_framing(renderer)
+    )
 
 
 def assemble_section_pdf(

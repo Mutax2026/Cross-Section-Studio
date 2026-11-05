@@ -615,3 +615,32 @@ def test_override_code_change_note_reaches_configure_preflight() -> None:
 
     note = f"{OVERRIDE_CODE_CHANGE_PREFIX} BH-01–BH-02: Clay joined to Silt"
     assert note.startswith(FENCE_NOTE_PREFIXES)
+
+
+def test_draft_watermark_stamps_every_pdf_page_in_every_layout() -> None:
+    """QA: DRAFT was on the figure page only; the summary / QA notes page of a
+    draft PDF read as final. Every page carries the mark when the flag is on."""
+    from export_framing import ExportFramingConfig
+
+    collars, lithology = _crossing_holes()
+    for layout in ("section_sheet", "consulting_section", "chart"):
+        draft = build_cross_section(
+            collars,
+            lithology,
+            [(0, 0), (50, 0)],
+            render_layout=layout,
+            export_formats=frozenset({"pdf"}),
+            export_framing=ExportFramingConfig(show_draft_watermark=True),
+        )
+        pages = _pdf_pages(draft.pdf_bytes)
+        assert len(pages) >= 2, layout
+        missing = [n for n, (_, _, text) in enumerate(pages, 1) if "DRAFT" not in text]
+        assert missing == [], f"{layout}: pages without DRAFT {missing}"
+        final = build_cross_section(
+            collars,
+            lithology,
+            [(0, 0), (50, 0)],
+            render_layout=layout,
+            export_formats=frozenset({"pdf"}),
+        )
+        assert all("DRAFT" not in text for _, _, text in _pdf_pages(final.pdf_bytes)), layout
