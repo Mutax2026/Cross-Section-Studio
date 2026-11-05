@@ -152,3 +152,33 @@ def test_same_length_downloads_get_different_file_ids() -> None:
 
     # Small files are hashed in full by Streamlit: left untouched.
     assert unique_download_bytes(b"<svg></svg>") == b"<svg></svg>"
+
+
+def test_export_metadata_keeps_every_qa_note_for_the_word_pack() -> None:
+    """QA: the Word pack kept the first 20 notes and silently dropped the rest;
+    the PDF QA page lists every note, so the metadata does too."""
+    import io
+
+    from docx import Document
+
+    from docx_export import build_figure_docx_bytes
+    from ui_helpers import export_metadata_payload
+
+    notes = [f"QA note {i:02d}" for i in range(1, 26)]
+    payload = export_metadata_payload(
+        section_title="T",
+        preset_label=None,
+        vertical_exaggeration=5.0,
+        hole_count=3,
+        transect_label="A-A'",
+        overlap_warnings=notes,
+    )
+    assert payload["qa_notes"] == notes
+    docx = build_figure_docx_bytes(png_bytes=b"", caption="c", title="T", metadata=payload)
+    cells = " ".join(
+        cell.text
+        for table in Document(io.BytesIO(docx)).tables
+        for row in table.rows
+        for cell in row.cells
+    )
+    assert all(note in cells for note in notes)
