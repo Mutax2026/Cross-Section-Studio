@@ -438,6 +438,62 @@ def test_rdl_against_limits_in_another_unit_edge_cases() -> None:
     ]
 
 
+def _validate_rdl_notes(readings: list[EnvironmentalReading]) -> list[str]:
+    holes = ("BH-01", "BH-02", "BH-09", "BH-10", "BH-11")
+    collars = [
+        Collar(hole_id=h, easting=i * 30.0, northing=0.0, elevation=100.0, total_depth=10.0)
+        for i, h in enumerate(holes)
+    ]
+    summary = summarize_environmental_readings(collars, readings, ("BH-01", "BH-02"))
+    return [w for w in summary.warnings if "detection limit" in w]
+
+
+def test_validate_rdl_uses_the_limits_unit_when_off_line_holes_set_it() -> None:
+    # Off-line BH-09..11 in mg/L set the limit (0.005 mg/L) and its unit; the
+    # on-line holes are mostly ug/L. 2 ug/L = 0.002 mg/L is below the limit.
+    readings = [
+        _reading(0.001, hole="BH-09", unit="mg/L", green_max=0.005),
+        _reading(0.001, hole="BH-10", unit="mg/L"),
+        _reading(0.001, hole="BH-11", unit="mg/L"),
+        _reading(1.0, hole="BH-01", unit="ug/L"),
+        _reading(2.0, detected=False, hole="BH-02", unit="ug/L"),
+    ]
+    assert _validate_rdl_notes(readings) == []
+
+
+def test_validate_rdl_reverse_off_line_ug_l_limit_catches_mg_l_non_detect() -> None:
+    readings = [
+        _reading(1.0, hole="BH-09", unit="ug/L", green_max=5.0),
+        _reading(1.0, hole="BH-10", unit="ug/L"),
+        _reading(1.0, hole="BH-11", unit="ug/L"),
+        _reading(0.001, hole="BH-01", unit="mg/L"),
+        _reading(0.01, detected=False, hole="BH-02", unit="mg/L"),
+    ]
+    assert _validate_rdl_notes(readings) == [
+        "BH-02 Benzene at 2 m: detection limit 10 ug/L exceeds guideline 5 ug/L — result inconclusive"
+    ]
+
+
+def test_validate_rdl_uses_the_limits_unit_when_superseded_rows_set_it() -> None:
+    import datetime as dt
+
+    old, new = dt.date(2024, 1, 1), dt.date(2026, 1, 1)
+    readings = [
+        _reading(0.001, hole="BH-01", unit="mg/L", green_max=0.005, date=old),
+        _reading(0.001, hole="BH-02", unit="mg/L", depth=5.0, date=old),
+        _reading(0.001, hole="BH-01", unit="mg/L", depth=5.0, date=old),
+        _reading(1.0, hole="BH-01", unit="ug/L", depth=5.0, date=new),
+        _reading(2.0, detected=False, hole="BH-02", unit="ug/L", depth=5.0, date=new),
+    ]
+    assert _validate_rdl_notes(readings) == []
+    # A detection limit that does exceed it is reported in the limit's unit.
+    readings[-1] = _reading(20.0, detected=False, hole="BH-02", unit="ug/L", depth=5.0, date=new)
+    assert _validate_rdl_notes(readings) == [
+        "BH-02 Benzene at 5 m: detection limit 0.02 mg/L exceeds guideline 0.005 mg/L"
+        " — result inconclusive"
+    ]
+
+
 def test_validate_summary_lists_rdl_and_mixed_unit_warnings() -> None:
     collars = [
         Collar(hole_id=h, easting=i * 30.0, northing=0.0, elevation=100.0, total_depth=12.0)
