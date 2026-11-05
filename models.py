@@ -130,14 +130,21 @@ def parse_monitoring_date(value: object) -> datetime.date | None:
     )
 
 
-_COLLAR_LIMITS = {"easting": 1e9, "northing": 1e9, "elevation": 1e5, "total_depth": 1e5}
+_COLLAR_LIMITS = {"easting": 1e9, "northing": 1e9, "elevation": 1e5}
 
 # Depths / elevations on the overlay sheets (Water, Screens, Environmental,
 # Deviations): anything beyond ±1,000 km is a typo (units, a pasted serial
 # number, 1e308) and would stretch the section axis to nothing.
 MAX_ABS_DEPTH_M = 1e6
-# Lithology intervals are bounded like Collars.total_depth (100 km).
-MAX_LITHOLOGY_DEPTH_M = 1e5
+# Lithology depths and Collars.total_depth: the deepest borehole ever drilled
+# is about 12.3 km, so anything past 15 km is a unit error or a pasted number
+# (an Excel date serial such as 44927 for 2023-01-01), not a hole.
+MAX_LITHOLOGY_DEPTH_M = 15_000.0
+MAX_TOTAL_DEPTH_M = MAX_LITHOLOGY_DEPTH_M
+# Excel stores a date as days since 1900: 20,000 is 1954-10-03, 80,000 is
+# 2119-01-11. A depth in that band past the plausibility bound is most likely
+# a date cell read as a number.
+EXCEL_DATE_SERIAL_RANGE = (20_000.0, 80_000.0)
 
 
 def reject_bool_number(value: object, field: str) -> object:
@@ -155,6 +162,27 @@ def check_bounded_number(value: float, field: str, limit: float = MAX_ABS_DEPTH_
         raise ValueError(
             f"{field} {value:g} is out of range (limit ±{limit:,.0f} m) — check the units"
         )
+    return value
+
+
+def check_borehole_depth(value: float, field: str, limit: float = MAX_LITHOLOGY_DEPTH_M) -> float:
+    """Finite and no deeper than ``limit`` metres (a plausible borehole).
+
+    Past the bound the row is an error; a value in the Excel date-serial band
+    says so, since a Depth cell Excel turned into a date reads as 20,000–80,000.
+    """
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be a finite number")
+    if abs(value) > limit:
+        low, high = EXCEL_DATE_SERIAL_RANGE
+        if low <= abs(value) <= high:
+            hint = (
+                " — it looks like an Excel date serial: format the column as Number (or Text "
+                "for from-to intervals) and re-enter the depth in metres"
+            )
+        else:
+            hint = " — check the units (depths are in metres)"
+        raise ValueError(f"{field} {value:g} is out of range (limit {limit:,.0f} m){hint}")
     return value
 
 
@@ -225,6 +253,8 @@ class Collar(BaseModel, frozen=True):
     @field_validator("easting", "northing", "elevation", "total_depth")
     @classmethod
     def require_finite(cls, value: float, info) -> float:
+        if info.field_name == "total_depth":
+            return check_borehole_depth(value, "total_depth", MAX_TOTAL_DEPTH_M)
         if not math.isfinite(value):
             raise ValueError(f"{info.field_name} must be a finite number")
         # Real coordinates (UTM / local grids) and elevations are far inside
@@ -299,7 +329,7 @@ class Lithology(BaseModel, frozen=True):
     @field_validator("from_depth", "to_depth")
     @classmethod
     def require_finite(cls, value: float, info) -> float:
-        return check_bounded_number(value, info.field_name, MAX_LITHOLOGY_DEPTH_M)
+        return check_borehole_depth(value, info.field_name, MAX_LITHOLOGY_DEPTH_M)
 
     @field_validator("hatch_pattern", mode="before")
     @classmethod

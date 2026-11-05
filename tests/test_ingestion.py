@@ -1344,3 +1344,155 @@ def test_blank_hole_id_rows_on_optional_sheets_are_row_errors() -> None:
         f"{sheet} row 2: hole_id is blank"
         for sheet in ("Water", "Screens", "Gradients", "Environmental")
     )
+
+
+# --- Review F2: depth interval units, date cells, row errors -------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("0.5-1.5", (0.5, 1.5)),
+        ("0.00-0.15m", (0.0, 0.15)),
+        ("0.00 - 2.00 m", (0.0, 2.0)),
+        ("0-2 m bgs", (0.0, 2.0)),
+        ("0 m-2 m", (0.0, 2.0)),
+        ("0-2 metres", (0.0, 2.0)),
+        ("0.5–1.5", (0.5, 1.5)),  # en dash
+        ("0.5 — 1.5 m bgl", (0.5, 1.5)),  # em dash
+        ("10-20 mm", (0.01, 0.02)),
+        ("50-150 cm", (0.5, 1.5)),
+        ("0-10 ft", (0.0, 3.048)),
+        ("0-10'", (0.0, 3.048)),
+        ("0 ft-10 ft", (0.0, 3.048)),
+    ],
+)
+def test_parse_depth_interval_units_and_dashes(text: str, expected: tuple[float, float]) -> None:
+    top, base = parse_depth_interval(text)
+    assert top == pytest.approx(expected[0])
+    assert base == pytest.approx(expected[1])
+
+
+def test_parse_depth_interval_rejects_dates_mixed_units_and_junk() -> None:
+    import datetime
+
+    # Excel turns "6-1" typed into a General cell into a date.
+    with pytest.raises(ValueError, match="date/time cell.*format the Depth column as Text"):
+        parse_depth_interval(datetime.datetime(2024, 6, 1))
+    with pytest.raises(ValueError, match="date/time cell"):
+        parse_depth_interval(pd.Timestamp("2024-06-01"))
+    with pytest.raises(ValueError, match="mixes units"):
+        parse_depth_interval("0 m-10 ft")
+    for junk in ("0-2 m abc", "1-2-3", "0.5 to 1.5", "", "2"):
+        with pytest.raises(ValueError, match="cannot parse depth interval"):
+            parse_depth_interval(junk)
+
+
+def _lith_row(hole: str, depth: object, lithology: str = "clay") -> dict:
+    return {"hole_id": hole, "depth": depth, "lithology": lithology, "lat": 58.57, "long": -119.19}
+
+
+def test_field_export_bad_depth_rows_are_row_errors_not_aborts() -> None:
+    import datetime
+
+    raw = _field_export_bytes(
+        [
+            _lith_row("BH-01", "0-10 ft"),  # row 2
+            _lith_row("BH-01", "10–20 ft", "sand"),  # row 3, en dash
+            _lith_row("BH-01", datetime.datetime(2024, 6, 1)),  # row 4, date cell
+            _lith_row("BH-02", "0-2 m"),  # row 5
+            _lith_row("BH-02", "two to three"),  # row 6
+        ]
+    )
+    result, _ = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    bh1 = sorted(
+        (item.from_depth, item.to_depth) for item in result.lithologies if item.hole_id == "BH-01"
+    )
+    assert bh1 == [pytest.approx((0.0, 3.048)), pytest.approx((3.048, 6.096))]
+    assert {collar.hole_id for collar in result.collars} == {"BH-01", "BH-02"}
+    row_errors = [error for error in result.errors if error.startswith("Lithology row")]
+    assert len(row_errors) == 2
+    assert row_errors[0].startswith("Lithology row 4 (BH-01): depth interval is a date/time cell")
+    assert row_errors[1].startswith("Lithology row 6 (BH-02): cannot parse depth interval")
+
+
+def test_field_export_every_row_bad_returns_errors_not_a_crash() -> None:
+    raw = _field_export_bytes([_lith_row("BH-01", "n/a"), _lith_row("BH-02", "0 m-3 ft")])
+    result, _ = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    assert not result.lithologies
+    assert any(error.startswith("Lithology row 2 (BH-01)") for error in result.errors)
+    assert any("mixes units" in error for error in result.errors)
+
+    adapter = FieldExportAdapter()
+    collars, lithology, _ = adapter.adapt(BytesIO(raw), load_profile("field_export_v1"))
+    assert collars.empty and lithology.empty
+    assert len(adapter.row_errors) == 2
+
+
+def test_export_platform_workbook_refuses_to_drop_bad_rows(tmp_path: Path) -> None:
+    raw = _field_export_bytes([_lith_row("BH-01", "0-2 m"), _lith_row("BH-01", "2-4 m-ish")])
+    output = tmp_path / "platform.xlsx"
+    with pytest.raises(ValueError, match=r"(?s)1 lithology row\(s\) could not be read.*Lithology row 3"):
+        export_platform_workbook(BytesIO(raw), output, profile_id="field_export_v1")
+    assert not output.exists()
+
+
+# --- Review F7: Field Data RL lookup -------------------------------------------------
+
+
+def test_field_data_rl_matches_case_insensitively_and_reports_conflicts() -> None:
+    raw = _field_export_bytes(
+        [_lith_row("BH-01", "0-2 m")],
+        extra_sheets={
+            "Field Data": pd.DataFrame(
+                [
+                    {"Label": "bh-01", "elevation": 640.0},
+                    {"Label": "BH-01 ", "elevation": 650.0},
+                    {"Label": "BH-02", "elevation": 700.0},  # no lithology: not applied
+                ]
+            )
+        },
+    )
+    result, report = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    assert [(c.hole_id, c.elevation) for c in result.collars] == [("BH-01", 640.0)]
+    assert "Field Data sheet: applied collar RL for 1 hole(s)." in report.warnings
+    conflict = [w for w in report.warnings if "conflicting collar RLs" in w]
+    assert conflict == [
+        "Field Data rows 2, 3 (bh-01): conflicting collar RLs 640.00 m / 650.00 m — using "
+        "640.00 m from row 2; keep one RL per hole."
+    ]
+    # Every collar took a surveyed RL: no "profile default 100 m" warning.
+    assert not any("profile default" in w for w in report.warnings)
+    assert not report.uses_placeholder_elevation
+
+
+def test_field_data_rl_within_tolerance_is_not_a_conflict() -> None:
+    raw = _field_export_bytes(
+        [_lith_row("BH-01", "0-2 m")],
+        extra_sheets={
+            "Field Data": pd.DataFrame(
+                [{"Label": "BH-01", "elevation": 640.0}, {"Label": "BH-01", "elevation": 640.005}]
+            )
+        },
+    )
+    _, report = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    assert not any("conflicting" in w for w in report.warnings)
+
+
+def test_profile_default_warning_names_only_holes_without_field_data_rl(tmp_path: Path) -> None:
+    raw = _field_export_bytes(
+        [_lith_row("BH-01", "0-2 m"), _lith_row("BH-03", "0-2 m")],
+        extra_sheets={"Field Data": pd.DataFrame([{"Label": "BH-01", "elevation": 640.0}])},
+    )
+    result, report = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    assert {c.hole_id: c.elevation for c in result.collars} == {"BH-01": 640.0, "BH-03": 100.0}
+    defaults = [w for w in report.warnings if "profile default" in w]
+    assert len(defaults) == 1
+    assert "for 1 hole(s) with no Field Data RL (BH-03)" in defaults[0]
+
+    collars, _ = export_platform_workbook(
+        BytesIO(raw), tmp_path / "out.xlsx", profile_id="field_export_v1"
+    )
+    datums = dict(zip(collars["hole_id"], collars["elevation_datum"]))
+    assert datums["BH-01"] is None
+    assert str(datums["BH-03"]).startswith("Placeholder")
