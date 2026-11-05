@@ -1283,6 +1283,42 @@ def test_lookalike_tab_without_hole_rows_is_not_flagged() -> None:
     assert not result.errors
 
 
+@pytest.mark.parametrize(
+    ("sheet", "rows"),
+    [
+        ("Water Quality", [{"hole_id": "BH1", "parameter": "Chloride", "value": 10, "unit": "mg/L"}]),
+        ("Groundwater Chemistry", [{"hole_id": "BH1", "Analyte": "Sodium", "Result": 1}]),
+        ("Surface Water", [{"hole_id": "BH1", "sample": "SW1"}]),
+        ("Water chemistry", [{"hole_id": "BH1", "depth": 3, "chloride": 120}]),
+        ("Groundwater Results", [{"hole_id": "BH1", "depth": 3, "parameter": "pH", "value": 7}]),
+        ("Screening Notes", [{"hole_id": "BH1", "note": "a"}]),
+        ("Well Screen Notes", [{"hole_id": "BH1", "note": "slot 10"}]),
+    ],
+)
+def test_chemistry_and_note_tabs_are_not_flagged_as_misnamed(sheet: str, rows: list[dict]) -> None:
+    """Review: lab tabs with hole_id/parameter/value rows were reported as misnamed
+    Water sheets; only tabs whose headers look like water levels / screen depths are."""
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, {sheet: rows}))
+    assert not [e for e in result.errors if "was not read" in e], result.errors
+
+
+@pytest.mark.parametrize(
+    ("sheet", "rows", "target"),
+    [
+        ("Water Levels", [{"hole_id": "BH1", "water_level_m": 3}], "Water"),
+        ("Groundwater Elevations", [{"hole_id": "BH1", "elevation_masl": 97}], "Water"),
+        ("Well Screen Details", [{"hole_id": "BH1", "top": 1, "bottom": 4}], "Screens"),
+        ("Screen Intervals", [{"hole_id": "BH1", "from": 1, "to": 4}], "Screens"),
+    ],
+)
+def test_misnamed_tabs_with_level_or_depth_headers_are_still_flagged(
+    sheet: str, rows: list[dict], target: str
+) -> None:
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, {sheet: rows}))
+    matches = [e for e in result.errors if f"The '{sheet}' sheet was not read" in e]
+    assert len(matches) == 1 and f"rename the tab to {target}" in matches[0], result.errors
+
+
 @pytest.mark.parametrize("sheet", ["Faults", "Unconformities"])
 @pytest.mark.parametrize(
     ("x_profile", "elevation", "expected"),
@@ -1360,9 +1396,25 @@ def test_blank_hole_id_rows_on_optional_sheets_are_row_errors() -> None:
         ("0-2 metres", (0.0, 2.0)),
         ("0.5–1.5", (0.5, 1.5)),  # en dash
         ("0.5 — 1.5 m bgl", (0.5, 1.5)),  # em dash
-        ("10-20 mm", (0.01, 0.02)),
-        ("50-150 cm", (0.5, 1.5)),
+        # bgs / bgl suffixes, "(m)" and notes with no digits parsed on 067b4a0.
+        ("0-2 m b.g.s.", (0.0, 2.0)),
+        ("0-1.5 m.b.g.", (0.0, 1.5)),
+        ("0-2 mbgs", (0.0, 2.0)),
+        ("0-2 m (bgs)", (0.0, 2.0)),
+        ("0-1.5 (m)", (0.0, 1.5)),
+        ("0 (m) - 1.5 (m)", (0.0, 1.5)),
+        ("0-1.5;", (0.0, 1.5)),
+        ("0-1.5 m,", (0.0, 1.5)),
+        ("1-2 m (fill)", (1.0, 2.0)),
+        ("1-2m approx", (1.0, 2.0)),
+        ("1-2 m b.g.s.", (1.0, 2.0)),
+        ("1-2 m BTOC", (1.0, 2.0)),
+        ("1-2 m;", (1.0, 2.0)),
+        ("0-2 m abc", (0.0, 2.0)),
         ("0-10 ft", (0.0, 3.048)),
+        ("0-10 (ft)", (0.0, 3.048)),
+        ("0-10 ft bgs", (0.0, 3.048)),
+        ("0-10 feet", (0.0, 3.048)),
         ("0-10'", (0.0, 3.048)),
         ("0 ft-10 ft", (0.0, 3.048)),
     ],
@@ -1383,9 +1435,37 @@ def test_parse_depth_interval_rejects_dates_mixed_units_and_junk() -> None:
         parse_depth_interval(pd.Timestamp("2024-06-01"))
     with pytest.raises(ValueError, match="mixes units"):
         parse_depth_interval("0 m-10 ft")
-    for junk in ("0-2 m abc", "1-2-3", "0.5 to 1.5", "", "2"):
+    for junk in ("1-2-3", "0.5 to 1.5", "", "2", "0-2 m (rev 3)", "1-2 m 3", "abc 0-2", "m 0-2"):
         with pytest.raises(ValueError, match="cannot parse depth interval"):
             parse_depth_interval(junk)
+
+
+@pytest.mark.parametrize("text", ["0-1.5 mm", "10-20 mm", "50-150 cm", "0 mm-2 mm", "0-2 millimetres"])
+def test_parse_depth_interval_mm_and_cm_are_typos_not_conversions(text: str) -> None:
+    """Borehole depths are not logged in mm / cm: "0-1.5 mm" means 0-1.5 m."""
+    with pytest.raises(ValueError, match="not logged in (mm|cm).*typo for m"):
+        parse_depth_interval(text)
+
+
+@pytest.mark.parametrize("text", ["0-2 km", "0-24 in", "0-24 inches", '0-24"', "0-3 yd"])
+def test_parse_depth_interval_other_units_are_row_errors_not_metres(text: str) -> None:
+    with pytest.raises(ValueError, match="enter depths in metres"):
+        parse_depth_interval(text)
+
+
+def test_field_export_mm_depth_is_a_row_error() -> None:
+    """Reviewer repro: "0-1.5 mm" became 1.5 mm of clay with no message."""
+    raw = _field_export_bytes(
+        [_lith_row("BH-1", "0-1.5 mm"), _lith_row("BH-1", "1.5-3 m", "sand"), _lith_row("BH-2", "0-2")]
+    )
+    result, _ = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    assert sorted((item.hole_id, item.from_depth, item.to_depth) for item in result.lithologies) == [
+        ("BH-1", 1.5, 3.0),
+        ("BH-2", 0.0, 2.0),
+    ]
+    row_errors = [error for error in result.errors if error.startswith("Lithology row")]
+    assert len(row_errors) == 1 and row_errors[0].startswith("Lithology row 2 (BH-1)")
+    assert "typo for m" in row_errors[0], row_errors
 
 
 def _lith_row(hole: str, depth: object, lithology: str = "clay") -> dict:
@@ -1430,7 +1510,7 @@ def test_field_export_every_row_bad_returns_errors_not_a_crash() -> None:
 
 
 def test_export_platform_workbook_refuses_to_drop_bad_rows(tmp_path: Path) -> None:
-    raw = _field_export_bytes([_lith_row("BH-01", "0-2 m"), _lith_row("BH-01", "2-4 m-ish")])
+    raw = _field_export_bytes([_lith_row("BH-01", "0-2 m"), _lith_row("BH-01", "2-4-6 m")])
     output = tmp_path / "platform.xlsx"
     with pytest.raises(ValueError, match=r"(?s)1 lithology row\(s\) could not be read.*Lithology row 3"):
         export_platform_workbook(BytesIO(raw), output, profile_id="field_export_v1")

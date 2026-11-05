@@ -786,6 +786,58 @@ _LOOKALIKE_SHEET_WORDS = {
     "screens": "Screens",
 }
 _LOOKALIKE_SHEET_CONTENT = {"Water": "water levels", "Screens": "screen intervals"}
+# Header words that show a lookalike tab really holds that sheet's data. A
+# "Water Quality" / "Groundwater Chemistry" tab of lab results is not a
+# misnamed Water sheet, so chemistry headers rule a Water lookalike out.
+_WATER_LEVEL_HEADER_WORDS = frozenset(
+    {"depth", "level", "levels", "wl", "dtw", "swl", "elevation", "elev", "masl", "status"}
+)
+_CHEMISTRY_HEADER_WORDS = frozenset(
+    {
+        "parameter",
+        "parameters",
+        "analyte",
+        "analytes",
+        "value",
+        "values",
+        "result",
+        "results",
+        "unit",
+        "units",
+        "concentration",
+        "conc",
+        "chemical",
+        "compound",
+        "guideline",
+        "rdl",
+        "mdl",
+    }
+)
+_CHEMISTRY_SHEET_WORDS = frozenset(
+    {"chemistry", "chem", "quality", "lab", "laboratory", "analytical", "analysis", "results"}
+)
+_SCREEN_DEPTH_PAIRS = (frozenset({"from", "to"}), frozenset({"top", "bottom"}))
+
+
+def _header_words(columns: Iterable[object]) -> set[str]:
+    return {word for column in columns for word in re.findall(r"[a-z]+", str(column).lower())}
+
+
+def _looks_like_lookalike_data(target: str, sheet_words: set[str], columns: Iterable[object]) -> bool:
+    """Whether a lookalike tab holds *target*'s data (not lab results or notes).
+
+    A Water lookalike needs a depth / level / status header and no chemistry
+    header or tab name ("Water Quality", "Groundwater Chemistry"); a Screens
+    lookalike needs from/to or top/bottom depth headers.
+    """
+    words = _header_words(columns)
+    if target == "Water":
+        return (
+            bool(words & _WATER_LEVEL_HEADER_WORDS)
+            and not words & _CHEMISTRY_HEADER_WORDS
+            and not sheet_words & _CHEMISTRY_SHEET_WORDS
+        )
+    return any(pair <= words for pair in _SCREEN_DEPTH_PAIRS)
 
 
 def _thickness_from_depth_to_product(
@@ -1202,6 +1254,8 @@ class DataParser:
             except Exception:  # unreadable tab (chart sheet etc.): not a data sheet
                 continue
             if not self._frame_has_hole_rows(frame):
+                continue
+            if not _looks_like_lookalike_data(target, words, frame.columns):
                 continue
             message = (
                 f"The '{name}' sheet was not read: {_LOOKALIKE_SHEET_CONTENT[target]} load only "

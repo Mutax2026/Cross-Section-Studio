@@ -116,19 +116,45 @@ TABLE_SECTIONS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _banner_pattern(key: str, qualifier: str = "") -> re.Pattern[str]:
-    # The key, an optional " / …" qualifier, then an optional "(…)" note.
-    return re.compile(rf"{key}{qualifier}(?:\s*\(.*\))?")
+def _banner_pattern(key: str) -> re.Pattern[str]:
+    # The key alone, or followed by a separator and anything: ":" / "(" /
+    # "/" ("COLLARS:", "COLLARS (required)", "ENVIRONMENTAL / LAB"), a spaced
+    # dash ("COLLARS - required", "COLLARS — required") or a space then a word
+    # ("WATER LEVELS", "LITHOLOGY LOG", "PROJECT METADATA"). Not a key run on
+    # into a letter, digit, "_" or "-" (WATERLOO-2, COLLARS2, WATER_1,
+    # WATER-01), nor a space then a digit ("WATER 1"): those are hole ids.
+    return re.compile(
+        rf"{key}(?:\s*[:(/].*|\s+[-–—](?:\s.*)?|\s+[^\W\d_].*)?",
+        re.IGNORECASE | re.DOTALL,
+    )
 
 
-# Data Entry banners as the template writes them ("COLLARS (required)",
-# "ENVIRONMENTAL / LAB (optional)", "PROJECT / CLIENT METADATA"). A hole id that
-# only starts with a key (WATER-01, WATERLOO-2) is a data row, not a banner.
-_SECTION_BANNERS: dict[str, re.Pattern[str]] = {
-    key: _banner_pattern(key, r"(?:\s*/\s*LAB)?" if key == "ENVIRONMENTAL" else "")
-    for key in TABLE_SECTIONS
-}
-_PROJECT_BANNER = _banner_pattern("PROJECT", r"(?:\s*/\s*CLIENT\s+METADATA)?")
+_SECTION_BANNERS: dict[str, re.Pattern[str]] = {key: _banner_pattern(key) for key in TABLE_SECTIONS}
+_PROJECT_BANNER = _banner_pattern("PROJECT")
+
+
+def _is_number_cell(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    try:
+        float(str(value).strip())
+    except ValueError:
+        return False
+    return True
+
+
+def _is_banner_row(pattern: re.Pattern[str], first: str, cells: list[object]) -> bool:
+    """*first* spells a banner and the rest of the row holds no numbers.
+
+    Template banners sit alone on their row (the project banner has a "value"
+    caption); every section's data rows carry a depth or coordinate, so a
+    number beside a banner-like first cell marks a data row, not a banner.
+    """
+    if not pattern.fullmatch(first):
+        return False
+    return not any(_is_number_cell(cell) for cell in cells[1:] if str(cell).strip())
 
 _HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
 _HEADER_FONT = Font(color="FFFFFF", bold=True, name="Calibri", size=11)
@@ -668,11 +694,9 @@ def parse_data_entry_sheet(frame: pd.DataFrame) -> DataEntrySheets:
         first = str(cells[0]).strip() if cells else ""
         if not first:
             continue
-        upper = first.upper()
-
         matched_section: str | None = None
         for key, banner in _SECTION_BANNERS.items():
-            if banner.fullmatch(upper):
+            if _is_banner_row(banner, first, cells):
                 matched_section = key
                 break
         if matched_section:
@@ -680,7 +704,7 @@ def parse_data_entry_sheet(frame: pd.DataFrame) -> DataEntrySheets:
             mode = "table_header"
             continue
 
-        if _PROJECT_BANNER.fullmatch(upper) and _normalize_key(first) not in project_fields:
+        if _is_banner_row(_PROJECT_BANNER, first, cells) and _normalize_key(first) not in project_fields:
             mode = "project"
             current_section = None
             continue

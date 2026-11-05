@@ -47,13 +47,22 @@ NATIVE_PROFILE_ID = "native_platform"
 DATA_ENTRY_PROFILE_ID = "data_entry_template"
 
 _DEPTH_NUMBER = r"(\d+(?:\.\d*)?|\.\d+)"
-_DEPTH_UNIT = r"(metres?|meters?|mm|cm|m|feet|foot|ft|')?"
-# "0.5-1.5", "0.00 - 2.00 m", "0-2 m bgs", "0 m-2 m", "0-10 ft", "0-10'".
-# En dash, em dash and the minus sign are normalised to "-" before matching.
-DEPTH_INTERVAL_PATTERN = re.compile(
-    rf"^{_DEPTH_NUMBER}\s*{_DEPTH_UNIT}\s*-\s*{_DEPTH_NUMBER}\s*{_DEPTH_UNIT}"
-    r"(?:\s*(?:bgs|bgl|bg))?\.?$"
+# Units read after either number. Units no borehole log uses (mm, cm, km,
+# inches, yards) are matched so they become row errors, not metres.
+_DEPTH_UNIT = (
+    r"(millimet(?:re|er)s?|centimet(?:re|er)s?|kilomet(?:re|er)s?|metres?|meters?"
+    r"|mm|cm|km(?![a-z])|inch(?:es)?(?![a-z])|in(?![a-z])|yards?(?![a-z])|yds?(?![a-z])"
+    r"|feet|foot|ft|m|'|\")?"
 )
+# "0.5-1.5", "0.00 - 2.00 m", "0-2 m bgs", "0-2 m b.g.s.", "0-1.5 m.b.g.",
+# "0 m-2 m", "0-10 ft", "0-10'", "1-2 m (fill)", "1-2m approx", "1-2 m;": after
+# the interval and its unit, a note with no digits is ignored (a second
+# number, "1-2-3" or "0-2 m (rev 3)", is not). En dash, em dash and the minus
+# sign are normalised to "-" and "(m)" / "(ft)" to "m" / "ft" before matching.
+DEPTH_INTERVAL_PATTERN = re.compile(
+    rf"^{_DEPTH_NUMBER}\s*{_DEPTH_UNIT}\s*-\s*{_DEPTH_NUMBER}\s*{_DEPTH_UNIT}[^\d]*$"
+)
+_DEPTH_PAREN_UNIT = re.compile(r"\(\s*(metres?|meters?|mm|cm|m|feet|foot|ft)\s*\)")
 _DEPTH_DASHES = str.maketrans({"\u2013": "-", "\u2014": "-", "\u2212": "-"})
 # Unit as written -> canonical unit; a blank unit is metres.
 _DEPTH_UNIT_CANONICAL = {
@@ -64,13 +73,34 @@ _DEPTH_UNIT_CANONICAL = {
     "meter": "m",
     "meters": "m",
     "mm": "mm",
+    "millimetre": "mm",
+    "millimetres": "mm",
+    "millimeter": "mm",
+    "millimeters": "mm",
     "cm": "cm",
+    "centimetre": "cm",
+    "centimetres": "cm",
+    "centimeter": "cm",
+    "centimeters": "cm",
+    "km": "km",
+    "kilometre": "km",
+    "kilometres": "km",
+    "kilometer": "km",
+    "kilometers": "km",
+    "in": "in",
+    "inch": "in",
+    "inches": "in",
+    '"': "in",
+    "yd": "yd",
+    "yds": "yd",
+    "yard": "yd",
+    "yards": "yd",
     "ft": "ft",
     "feet": "ft",
     "foot": "ft",
     "'": "ft",
 }
-_DEPTH_UNIT_TO_M = {"m": 1.0, "cm": 0.01, "mm": 0.001, "ft": 0.3048}
+_DEPTH_UNIT_TO_M = {"m": 1.0, "ft": 0.3048}
 
 
 class DetectRules(BaseModel):
@@ -288,10 +318,12 @@ class DepthParser:
 def parse_depth_interval(depth_value: object) -> tuple[float, float]:
     """``"from-to"`` depth text to metres (``0.5-1.5``, ``0-2 m bgs``, ``0-10 ft``).
 
-    A unit may follow either number (``m``, ``cm``, ``mm``, ``ft`` / ``'``; blank
-    is metres); feet, cm and mm are converted to metres. En and em dashes are
-    accepted as the separator. A date cell (Excel auto-converted ``6-1`` to a
-    date) and any other text raise ``ValueError``.
+    A unit may follow either number (``m``, ``(m)``, ``ft`` / ``'``; blank is
+    metres); feet are converted to metres. A note with no digits may follow
+    (``0-2 m b.g.s.``, ``1-2 m (fill)``, ``1-2 m;``). En and em dashes are
+    accepted as the separator. mm / cm (a typo for m in a borehole log), other
+    units, mixed units, a second number, a date cell (Excel auto-converted
+    ``6-1`` to a date) and any other text raise ``ValueError``.
     """
     if depth_value is None or (isinstance(depth_value, float) and pd.isna(depth_value)):
         raise ValueError("missing depth interval")
@@ -305,6 +337,7 @@ def parse_depth_interval(depth_value: object) -> tuple[float, float]:
             "(e.g. 0.5-1.5 m)"
         )
     text = str(depth_value).strip().lower().translate(_DEPTH_DASHES)
+    text = _DEPTH_PAREN_UNIT.sub(r" \1", text)
     match = DEPTH_INTERVAL_PATTERN.match(text)
     if not match:
         raise ValueError(
@@ -312,6 +345,19 @@ def parse_depth_interval(depth_value: object) -> tuple[float, float]:
             "(e.g. 0.5-1.5 m)"
         )
     from_text, from_unit, to_text, to_unit = match.groups()
+    for written in (from_unit, to_unit):
+        unit = _DEPTH_UNIT_CANONICAL[written or ""]
+        if unit in ("mm", "cm"):
+            raise ValueError(
+                f"depth interval {depth_value!r} is in {written} — borehole depths are not "
+                f"logged in {unit}, so this is almost certainly a typo for m; re-enter it "
+                f"as {from_text}-{to_text} m (or convert it to metres)"
+            )
+        if unit not in _DEPTH_UNIT_TO_M:
+            raise ValueError(
+                f"depth interval {depth_value!r} is in {written} — enter depths in metres "
+                "(e.g. 0.5-1.5 m) or feet (e.g. 0-10 ft)"
+            )
     if from_unit and to_unit and _DEPTH_UNIT_CANONICAL[from_unit] != _DEPTH_UNIT_CANONICAL[to_unit]:
         raise ValueError(
             f"depth interval {depth_value!r} mixes units ({from_unit} and {to_unit}) — "
