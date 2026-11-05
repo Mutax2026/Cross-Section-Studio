@@ -606,3 +606,113 @@ def test_normalize_pdf_pages_fits_every_page_on_letter_landscape() -> None:
     normalized = _pdf_pages(normalize_pdf_pages(pdf))
     assert {page[:2] for page in normalized} == {(11.0, 8.5)}
     assert "QA notes" in normalized[1][2]
+
+
+def _override_code_change_section() -> tuple[list[Collar], list[Lithology], list]:
+    """Two holes whose top units (Clay in A, Silt in B) are joined by an override."""
+    from models import CorrelationOverride
+
+    collars = [
+        Collar(hole_id="A", easting=0.0, northing=0.0, elevation=100.0, total_depth=20.0),
+        Collar(hole_id="B", easting=50.0, northing=0.0, elevation=100.0, total_depth=20.0),
+    ]
+    lithology = [
+        Lithology(hole_id="A", from_depth=0, to_depth=10, lithology_code="Clay", unit_order=1),
+        Lithology(hole_id="A", from_depth=10, to_depth=20, lithology_code="Sand", unit_order=2),
+        Lithology(hole_id="B", from_depth=0, to_depth=12, lithology_code="Silt", unit_order=1),
+        Lithology(hole_id="B", from_depth=12, to_depth=20, lithology_code="Sand", unit_order=2),
+    ]
+    overrides = [
+        CorrelationOverride(left_hole_id="A", right_hole_id="B", left_unit_order=1, right_unit_order=1)
+    ]
+    return collars, lithology, overrides
+
+
+def test_override_code_change_note_reaches_configure_preflight() -> None:
+    """The real override facies note survives the Configure preflight prefix filter
+    (``app_services.cached_configure_preflight`` keeps ``overlap_warnings`` that
+    start with ``FENCE_NOTE_PREFIXES``)."""
+    import json
+
+    from app_services import cached_configure_preflight
+    from models import ParseResult
+    from pipeline import FENCE_NOTE_PREFIXES, compute_section_geometry
+
+    collars, lithology, overrides = _override_code_change_section()
+    transect = [(-10.0, 0.0), (60.0, 0.0)]
+    geometry = compute_section_geometry(
+        collars, lithology, transect, correlation_overrides=overrides
+    )
+    notes = [
+        message for message in geometry.overlap_warnings if message.startswith(FENCE_NOTE_PREFIXES)
+    ]
+    assert len(notes) == 1
+    for text in ("A", "B", "Clay", "Silt", "facies change"):
+        assert text in notes[0]
+
+    subset = ParseResult(collars=tuple(collars), lithologies=tuple(lithology), errors=())
+    preflight_warnings, summaries = cached_configure_preflight(
+        subset.model_dump_json(),
+        json.dumps(transect),
+        "interpolated",
+        True,
+        json.dumps([override.model_dump(mode="json") for override in overrides]),
+        500.0,
+    )
+    assert notes[0] in preflight_warnings
+    assert summaries[0].override_code_changes == (("Clay", "Silt"),)
+
+
+def test_draft_watermark_stamps_every_pdf_page_in_every_layout() -> None:
+    """QA: DRAFT was on the figure page only; the summary / QA notes page of a
+    draft PDF read as final. Every page carries the mark when the flag is on."""
+    from export_framing import ExportFramingConfig
+
+    collars, lithology = _crossing_holes()
+    for layout in ("section_sheet", "consulting_section", "chart"):
+        draft = build_cross_section(
+            collars,
+            lithology,
+            [(0, 0), (50, 0)],
+            render_layout=layout,
+            export_formats=frozenset({"pdf"}),
+            export_framing=ExportFramingConfig(show_draft_watermark=True),
+        )
+        pages = _pdf_pages(draft.pdf_bytes)
+        assert len(pages) >= 2, layout
+        missing = [n for n, (_, _, text) in enumerate(pages, 1) if "DRAFT" not in text]
+        assert missing == [], f"{layout}: pages without DRAFT {missing}"
+        final = build_cross_section(
+            collars,
+            lithology,
+            [(0, 0), (50, 0)],
+            render_layout=layout,
+            export_formats=frozenset({"pdf"}),
+        )
+        assert all("DRAFT" not in text for _, _, text in _pdf_pages(final.pdf_bytes)), layout
+
+
+def test_off_transect_warnings_reach_geometry_notes_and_pdf() -> None:
+    """QA: Generate showed "BH-01 is 5.0 m from transect" but the pipeline only
+    logged it, so the PDF QA page and Word pack never said so."""
+    from models import Transect
+    from projection import off_transect_warnings
+
+    collars, lithology = _crossing_holes()
+    line = [(0, 5), (50, 5)]
+    expected = off_transect_warnings(collars, Transect(points=line), 1.0)
+    assert expected == [
+        "A is 5.0 m from transect (threshold 1.0 m)",
+        "B is 5.0 m from transect (threshold 1.0 m)",
+    ]
+    geometry = compute_section_geometry(collars, lithology, line, offset_warning_m=1.0)
+    assert [w for w in geometry.overlap_warnings if "from transect" in w] == expected
+    result = build_cross_section(
+        collars, lithology, line, offset_warning_m=1.0, export_formats=frozenset({"pdf"})
+    )
+    assert [w for w in result.overlap_warnings if "from transect" in w] == expected
+    pdf_text = " ".join(text for _, _, text in _pdf_pages(result.pdf_bytes))
+    assert all(message in pdf_text for message in expected)
+    # Under the threshold: no note.
+    near = compute_section_geometry(collars, lithology, line, offset_warning_m=10.0)
+    assert not [w for w in near.overlap_warnings if "from transect" in w]

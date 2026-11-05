@@ -6,7 +6,9 @@ Engine module (no Streamlit). Used by the Validate summary
 
 Units: threshold limits carry no unit of their own -- they are read in the
 parameter's *main* unit, the unit most of its readings use
-(:func:`dominant_units`). A workbook ``green_max`` / ``orange_max`` typed on a
+(:func:`dominant_units`) -- most of the readings the limits were taken from
+(:func:`threshold_units`), which a check on fewer readings (the latest on-line
+samples) must be told, since those may favour another unit. A workbook ``green_max`` / ``orange_max`` typed on a
 row in another unit is taken to be in that row's unit and converted with the
 row's value (:func:`workbook_threshold_limits`, :func:`harmonize_units`); when
 the row's unit cannot be converted its limits are ignored, with a Validate
@@ -340,6 +342,9 @@ class WorkbookLimits:
     thresholds: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
     # Validate warnings for rows whose limits could not be converted (ignored).
     warnings: list[str] = field(default_factory=list)
+    # Parameter key (chemistry_parameter_key) -> the main unit the limits are
+    # in (:func:`threshold_units`), for every parameter with a unit.
+    units: dict[str, str] = field(default_factory=dict)
 
 
 def workbook_threshold_limits(readings: Iterable[object]) -> WorkbookLimits:
@@ -354,11 +359,11 @@ def workbook_threshold_limits(readings: Iterable[object]) -> WorkbookLimits:
     to mg/L — ignored").
     """
     readings = list(readings)
-    dominant = dominant_units(readings)
+    dominant = threshold_units(readings)
     ratio_families = _ratio_families(readings)
     found: dict[str, list[float | None]] = {}
     names: dict[str, str] = {}
-    result = WorkbookLimits()
+    result = WorkbookLimits(units=dict(dominant))
     for reading in readings:
         name = str(getattr(reading, "parameter", "") or "").strip()
         key = chemistry_parameter_key(name)
@@ -379,6 +384,20 @@ def workbook_threshold_limits(readings: Iterable[object]) -> WorkbookLimits:
                 pair[index] = limit
     result.thresholds = {names[key]: (pair[0], pair[1]) for key, pair in found.items()}
     return result
+
+
+def threshold_units(readings: Iterable[object]) -> dict[str, str]:
+    """Unit each parameter's limits are in, for limits taken from ``readings``.
+
+    Parameter key (:func:`chemistry_parameter_key`) -> main unit, by the rule
+    :func:`workbook_threshold_limits` (``chemistry_thresholds_from_readings``)
+    reads its limits in: the unit most of ``readings`` use
+    (:func:`dominant_units`). Pass the *same* reading set that produced the
+    limits -- every Environmental row, off-line holes and superseded dates
+    included -- to :func:`rdl_above_guideline_notes`: the readings a check
+    looks at (the latest on-line samples) may favour another unit.
+    """
+    return dominant_units(readings)
 
 
 def ignored_limit_warnings(readings: Iterable[object]) -> list[str]:
@@ -495,22 +514,81 @@ def rdl_above_guideline_note(reading: object, green_max: float) -> str:
     )
 
 
+def rdl_unconvertible_note(reading: object, green_max: float, main_unit: str) -> str:
+    """``"BH-2 Benzene at 3 m: detection limit 2 mg/kg not compared with guideline 0.005 mg/L —
+    mg/kg cannot be converted to mg/L"``."""
+    unit = str(getattr(reading, "unit", "") or "").strip()
+    hole_id = getattr(reading, "hole_id", "")
+    parameter = getattr(reading, "parameter", "")
+    depth = float(getattr(reading, "sample_depth"))
+    return (
+        f"{hole_id} {parameter} at {depth:g} m: detection limit "
+        f"{_with_unit(getattr(reading, 'value'), unit)} not compared with guideline "
+        f"{_with_unit(green_max, main_unit)} — {unit} cannot be converted to {main_unit}"
+    )
+
+
 def rdl_above_guideline_notes(
     readings: Iterable[object],
     thresholds: Mapping[str, ChemistryThresholdPair] | None,
+    threshold_units: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Notes for non-detects whose detection limit exceeds the parameter's own green limit.
 
     Only parameters with an explicit green limit in ``thresholds`` are checked
     (Validate uses the workbook ``green_max`` values; the figure resolves its
     own limits per parameter and calls :func:`rdl_above_guideline_note`).
+
+    ``threshold_units`` names the unit each parameter's limits are in
+    (parameter name or key -> unit, e.g. :func:`threshold_units` of the
+    readings the limits came from). Without it, or for a parameter it does
+    not name, the limits are taken to be in the main unit of ``readings``
+    themselves (:func:`dominant_units`). Each detection limit is converted
+    from its own unit to the limits' unit before comparing (:func:`convert_unit`;
+    ppm / ppb join the matrix of the parameter's other units and of the
+    limits' unit) and the note prints both numbers in that unit. A detection
+    limit without a unit is read in the limits' unit. A detection limit whose
+    unit cannot be converted is not compared; its note says so
+    (:func:`rdl_unconvertible_note`).
     """
+    readings = list(readings)
+    dominant = dominant_units(readings)
+    given = {
+        chemistry_parameter_key(str(name)): str(unit or "").strip()
+        for name, unit in (threshold_units or {}).items()
+    }
+    families: dict[str, set[str]] = {}
+    for reading in readings:
+        key = chemistry_parameter_key(str(getattr(reading, "parameter", "") or ""))
+        family = unit_family(getattr(reading, "unit", ""))
+        if key and family is not None and family[0] != "ratio":
+            families.setdefault(key, set()).add(family[0])
     notes: list[str] = []
     for reading in readings:
-        green_max, _orange = chemistry_threshold_pair_for(
-            str(getattr(reading, "parameter", "")), thresholds
-        )
+        if getattr(reading, "detected", True):
+            continue
+        parameter = str(getattr(reading, "parameter", ""))
+        green_max, _orange = chemistry_threshold_pair_for(parameter, thresholds)
+        if green_max is None:
+            continue
+        key = chemistry_parameter_key(parameter)
+        target = given.get(key) or dominant.get(key, "")
+        unit = str(getattr(reading, "unit", "") or "").strip()
+        if unit and target and unit_key(unit) != unit_key(target):
+            matrix = set(families.get(key, ()))
+            target_family = unit_family(target)
+            if target_family is not None and target_family[0] != "ratio":
+                matrix.add(target_family[0])
+            ratio_family = next(iter(matrix)) if len(matrix) == 1 else None
+            converted = convert_unit(
+                float(getattr(reading, "value")), unit, target, ratio_family=ratio_family
+            )
+            if converted is None:
+                notes.append(rdl_unconvertible_note(reading, green_max, target))
+                continue
+            reading = reading.model_copy(  # type: ignore[attr-defined]
+                update={"value": converted, "unit": target}
+            )
         if rdl_exceeds_guideline(reading, green_max):
-            assert green_max is not None
             notes.append(rdl_above_guideline_note(reading, green_max))
     return notes

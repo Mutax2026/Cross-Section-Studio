@@ -36,6 +36,11 @@ NEAR_FIELD_PINCH_FRACTION = 0.25
 # sync with ``ai_quality.ZERO_THICKNESS_M``.
 MIN_FENCE_THICKNESS_M = 1e-3
 
+# Fence note for a correlation override that joins units of different lithology
+# codes (drawn as a lateral facies change at mid-span); see
+# ``override_code_change_note``.
+OVERRIDE_CODE_CHANGE_PREFIX = "Override joins different codes"
+
 
 @dataclass(frozen=True)
 class GeologicalPolygon:
@@ -713,6 +718,7 @@ def _polygons_for_pair(
     right_lookup: dict[Hashable, _LayerInterval] | None = None,
     correlation_overrides: Sequence[CorrelationOverride] = (),
     pair_summaries: list[CorrelationPairSummary] | None = None,
+    fence_notes: list[str] | None = None,
 ) -> list[GeologicalPolygon]:
     polygons: list[GeologicalPolygon] = []
     if left_lookup is None:
@@ -861,24 +867,56 @@ def _polygons_for_pair(
 
     # Pass 2: continuous fills (with bent contacts), then wedges.
     for key, left_layer, right_layer in matched:
-        top_path = _bend_path(top_bends.get(key, ()), x_left, x_right)
-        bottom_path = _bend_path(bottom_bends.get(key, ()), x_left, x_right)
-        polygon = _make_polygon(
-            [
-                (x_left, left_layer.top_elevation),
-                *top_path,
-                (x_right, right_layer.top_elevation),
-                (x_right, right_layer.bottom_elevation),
-                *reversed(bottom_path),
-                (x_left, left_layer.bottom_elevation),
-            ],
-            left_layer.lithology_code,
-            hole_pair,
-            # Below a short hole's TD the fill is interpolated, not logged.
-            is_pinch_out=left_layer.inferred or right_layer.inferred,
-        )
-        if polygon:
-            polygons.append(polygon)
+        top_line = [
+            (x_left, left_layer.top_elevation),
+            *_bend_path(top_bends.get(key, ()), x_left, x_right),
+            (x_right, right_layer.top_elevation),
+        ]
+        bottom_line = [
+            (x_left, left_layer.bottom_elevation),
+            *_bend_path(bottom_bends.get(key, ()), x_left, x_right),
+            (x_right, right_layer.bottom_elevation),
+        ]
+        if left_layer.lithology_code == right_layer.lithology_code:
+            pieces = [(left_layer.lithology_code, top_line, bottom_line)]
+        else:
+            # Only an explicit override can join different codes (automatic keys
+            # carry the code). One fill in the left code hid the right hole's
+            # unit, so draw a lateral facies change at mid-span and say so.
+            x_mid = 0.5 * (x_left + x_right)
+            pieces = [
+                (
+                    left_layer.lithology_code,
+                    _clip_line(top_line, x_left, x_mid),
+                    _clip_line(bottom_line, x_left, x_mid),
+                ),
+                (
+                    right_layer.lithology_code,
+                    _clip_line(top_line, x_mid, x_right),
+                    _clip_line(bottom_line, x_mid, x_right),
+                ),
+            ]
+            if fence_notes is not None:
+                note = override_code_change_note(
+                    left_hole_id,
+                    right_hole_id,
+                    left_layer.lithology_code,
+                    right_layer.lithology_code,
+                )
+                # Two overrides joining the same codes on one pair read the same:
+                # say it once (the pair summary still counts each override).
+                if note not in fence_notes:
+                    fence_notes.append(note)
+        for code, top, bottom in pieces:
+            polygon = _make_polygon(
+                [*top, *reversed(bottom)],
+                code,
+                hole_pair,
+                # Below a short hole's TD the fill is interpolated, not logged.
+                is_pinch_out=left_layer.inferred or right_layer.inferred,
+            )
+            if polygon:
+                polygons.append(polygon)
 
     for source_layer, x_source, x_other, z_tip in wedges:
         polygon = _make_polygon(
@@ -1209,6 +1247,40 @@ def _bend_path(
         if min(x_left, x_right) < x < max(x_left, x_right):
             by_x.setdefault(x, z)
     return sorted(by_x.items())
+
+
+def _clip_line(
+    line: Sequence[tuple[float, float]], x_start: float, x_end: float
+) -> list[tuple[float, float]]:
+    """Part of a left→right contact polyline between ``x_start`` and ``x_end``.
+
+    Both ends are interpolated on the polyline, so two adjacent clips share the
+    vertex where they meet (the facies boundary of a split override fill).
+    """
+
+    def _z_at(x: float) -> float:
+        for (x0, z0), (x1, z1) in zip(line, line[1:]):
+            if x0 <= x <= x1:
+                return _interpolate(x0, z0, x1, z1, x)
+        return line[0][1] if x <= line[0][0] else line[-1][1]
+
+    return [
+        (x_start, _z_at(x_start)),
+        *((x, z) for x, z in line if x_start < x < x_end),
+        (x_end, _z_at(x_end)),
+    ]
+
+
+def override_code_change_note(
+    left_hole_id: str, right_hole_id: str, left_code: str, right_code: str
+) -> str:
+    """Fence note for a correlation override joining units of different codes."""
+    return (
+        f"{OVERRIDE_CODE_CHANGE_PREFIX} {left_hole_id}–{right_hole_id}: "
+        f"{left_code} in {left_hole_id} is joined to {right_code} in {right_hole_id} — "
+        f"drawn as a facies change at mid-span ({left_code} on the {left_hole_id} side, "
+        f"{right_code} on the {right_hole_id} side); check the override"
+    )
 
 
 def _pinch_out_wedge_coords(
@@ -1556,10 +1628,19 @@ class CorrelationPairSummary:
     # two holes and was un-matched (drawn as pinch-outs instead); see
     # ``_drop_crossing_matches``.
     crossing_codes: tuple[str, ...] = ()
+    # ``(left_code, right_code)`` for each correlation override that joins units
+    # of different lithology codes (repeated when several overrides join the same
+    # codes). Drawn as a facies change, not a clean match: excluded from
+    # ``matched_count`` and each counted as unmatched.
+    override_code_changes: tuple[tuple[str, str], ...] = ()
 
     @property
     def unmatched_keys_count(self) -> int:
-        return len(self.left_only_codes) + len(self.right_only_codes)
+        return (
+            len(self.left_only_codes)
+            + len(self.right_only_codes)
+            + len(self.override_code_changes)
+        )
 
     @property
     def match_rate(self) -> float:
@@ -1701,25 +1782,82 @@ def _collapse_coincident_holes(
     return collapsed
 
 
+def _probe_runs(item: GeologicalPolygon, x: float) -> list[tuple[float, float]]:
+    """``(top, bottom)`` runs where the vertical line at ``x`` meets ``item``."""
+    _min_x, min_z, _max_x, max_z = item.polygon.bounds
+    probe = LineString([(x, min_z - 1.0), (x, max_z + 1.0)])
+    try:
+        hit = item.polygon.intersection(probe)
+    except GEOSException:  # pragma: no cover - defensive
+        hit = _unsnapped(item.polygon).intersection(probe)
+    runs: list[tuple[float, float]] = []
+    for part in getattr(hit, "geoms", [hit]):
+        if part.is_empty or part.geom_type != "LineString":
+            continue
+        zs = [z for _x, z in part.coords]
+        if max(zs) - min(zs) >= MIN_FENCE_THICKNESS_M:
+            runs.append((max(zs), min(zs)))
+    return runs
+
+
+def _uncovered_runs(
+    top: float, bottom: float, covered: Sequence[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Parts of ``top``..``bottom`` outside every ``(top, bottom)`` run in ``covered``."""
+    pieces = [(top, bottom)]
+    for cover_top, cover_bottom in covered:
+        remaining: list[tuple[float, float]] = []
+        for piece_top, piece_bottom in pieces:
+            if cover_bottom >= piece_top or cover_top <= piece_bottom:
+                remaining.append((piece_top, piece_bottom))
+                continue
+            if piece_top > cover_top:
+                remaining.append((piece_top, cover_top))
+            if cover_bottom > piece_bottom:
+                remaining.append((cover_bottom, piece_bottom))
+        pieces = remaining
+    return [piece for piece in pieces if piece[0] - piece[1] >= MIN_FENCE_THICKNESS_M]
+
+
 def _fence_column_at(polygons: list[GeologicalPolygon], x: float) -> list[tuple[str, float, float]]:
     """``(code, top, bottom)`` runs where the vertical line at ``x`` crosses the fence,
-    top-down; touching runs of one code are merged."""
+    top-down; touching runs of one code are merged.
+
+    A polygon whose vertical edge lies on ``x`` (the two halves of a split
+    override fill meet at mid-span; a facies-change tile can end there too) is
+    neither strictly left nor right of the line, so polygons spanning ``x`` were
+    the only ones probed and a column at the edge lost that unit (the caller's
+    gap closing then stretched its neighbours over it). Edge polygons now fill
+    whatever the spanning ones leave uncovered, each depth claimed once: the
+    lithology code sorting first owns a shared edge (independent of transect
+    direction), so the column never stacks both halves.
+    """
     runs: list[tuple[str, float, float]] = []
+    edge_items: list[tuple[GeologicalPolygon, float]] = []
     for item in polygons:
-        min_x, min_z, max_x, max_z = item.polygon.bounds
-        if not (min_x < x < max_x):
+        min_x, _min_z, max_x, _max_z = item.polygon.bounds
+        if min_x < x < max_x:
+            runs.extend((item.lithology_code, top, bottom) for top, bottom in _probe_runs(item, x))
             continue
-        probe = LineString([(x, min_z - 1.0), (x, max_z + 1.0)])
-        try:
-            hit = item.polygon.intersection(probe)
-        except GEOSException:  # pragma: no cover - defensive
-            hit = _unsnapped(item.polygon).intersection(probe)
-        for part in getattr(hit, "geoms", [hit]):
-            if part.is_empty or part.geom_type != "LineString":
-                continue
-            zs = [z for _x, z in part.coords]
-            if max(zs) - min(zs) >= MIN_FENCE_THICKNESS_M:
-                runs.append((item.lithology_code, max(zs), min(zs)))
+        tol = 1e-9 * max(1.0, abs(x))
+        for edge_x in (min_x, max_x):
+            if max_x - min_x > tol and abs(edge_x - x) <= tol:
+                edge_items.append((item, edge_x))
+                break
+    covered = [(top, bottom) for _code, top, bottom in runs]
+    edge_items.sort(
+        key=lambda entry: (
+            entry[0].lithology_code,
+            -entry[0].polygon.bounds[3],
+            entry[0].hole_pair,
+            entry[0].polygon.bounds,
+        )
+    )
+    for item, edge_x in edge_items:
+        for top, bottom in _probe_runs(item, edge_x):
+            for piece in _uncovered_runs(top, bottom, covered):
+                runs.append((item.lithology_code, *piece))
+                covered.append(piece)
     runs.sort(key=lambda run: (-run[1], -run[2]))
     merged: list[tuple[str, float, float]] = []
     for code, top, bottom in runs:
@@ -1886,12 +2024,18 @@ def _correlation_pair_summary(
     right_only: set[str] = set()
     pinch_outs = 0
     crossing: set[str] = set()
+    # One entry per override (not per code pair): two Clay->Silt overrides on
+    # one pair are two units drawn as facies changes, not one.
+    code_changes: list[tuple[str, str]] = []
     for key, left_layer in left_lookup.items():
         if isinstance(key, tuple) and key and key[0] == "crossed":
             crossing.add(left_layer.lithology_code)
         right_layer = right_lookup.get(key)
         if right_layer is not None:
-            matched += 1
+            if right_layer.lithology_code != left_layer.lithology_code:
+                code_changes.append((left_layer.lithology_code, right_layer.lithology_code))
+            else:
+                matched += 1
             continue
         left_only.add(left_layer.lithology_code)
         if allow_pinch_outs:
@@ -1910,6 +2054,7 @@ def _correlation_pair_summary(
         right_only_codes=tuple(sorted(right_only)),
         pinch_out_candidates=pinch_outs,
         crossing_codes=tuple(sorted(crossing)),
+        override_code_changes=tuple(sorted(code_changes)),
     )
 
 
@@ -1998,6 +2143,7 @@ def build_stratigraphy(
                 right_lookup=right_lookup,
                 correlation_overrides=_overrides_for_hole_pair(left_id, right_id, override_index),
                 pair_summaries=pair_summaries,
+                fence_notes=clip_warnings,
             ),
             clip_warnings=clip_warnings,
             hole_xs=(x_left, x_right),

@@ -760,6 +760,86 @@ def _blank_cell(value: object) -> bool:
     return isinstance(value, str) and not value.strip()
 
 
+def _frame_has_values(frame: pd.DataFrame) -> bool:
+    """True when any data cell (below the header) holds something."""
+    return any(not _blank_cell(value) for value in frame.to_numpy().ravel())
+
+
+def _structure_coordinate(value: object, field: str) -> float:
+    """Fault / unconformity coordinate in metres; a clear error for "12 m" etc."""
+    reject_bool_number(value, field)
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{field} '{_cell_text(value)}' is not a number — enter metres without units"
+        ) from None
+    return check_bounded_number(number, field)
+
+
+# Words in a tab name that show it was meant as an optional sheet the parser
+# reads only by its exact name. Such a tab is reported, not silently skipped.
+_LOOKALIKE_SHEET_WORDS = {
+    "water": "Water",
+    "groundwater": "Water",
+    "screen": "Screens",
+    "screens": "Screens",
+}
+_LOOKALIKE_SHEET_CONTENT = {"Water": "water levels", "Screens": "screen intervals"}
+# Header words that show a lookalike tab really holds that sheet's data. A
+# "Water Quality" / "Groundwater Chemistry" tab of lab results is not a
+# misnamed Water sheet, so chemistry headers rule a Water lookalike out.
+_WATER_LEVEL_HEADER_WORDS = frozenset(
+    {"depth", "level", "levels", "wl", "dtw", "swl", "elevation", "elev", "masl", "status"}
+)
+_CHEMISTRY_HEADER_WORDS = frozenset(
+    {
+        "parameter",
+        "parameters",
+        "analyte",
+        "analytes",
+        "value",
+        "values",
+        "result",
+        "results",
+        "unit",
+        "units",
+        "concentration",
+        "conc",
+        "chemical",
+        "compound",
+        "guideline",
+        "rdl",
+        "mdl",
+    }
+)
+_CHEMISTRY_SHEET_WORDS = frozenset(
+    {"chemistry", "chem", "quality", "lab", "laboratory", "analytical", "analysis", "results"}
+)
+_SCREEN_DEPTH_PAIRS = (frozenset({"from", "to"}), frozenset({"top", "bottom"}))
+
+
+def _header_words(columns: Iterable[object]) -> set[str]:
+    return {word for column in columns for word in re.findall(r"[a-z]+", str(column).lower())}
+
+
+def _looks_like_lookalike_data(target: str, sheet_words: set[str], columns: Iterable[object]) -> bool:
+    """Whether a lookalike tab holds *target*'s data (not lab results or notes).
+
+    A Water lookalike needs a depth / level / status header and no chemistry
+    header or tab name ("Water Quality", "Groundwater Chemistry"); a Screens
+    lookalike needs from/to or top/bottom depth headers.
+    """
+    words = _header_words(columns)
+    if target == "Water":
+        return (
+            bool(words & _WATER_LEVEL_HEADER_WORDS)
+            and not words & _CHEMISTRY_HEADER_WORDS
+            and not sheet_words & _CHEMISTRY_SHEET_WORDS
+        )
+    return any(pair <= words for pair in _SCREEN_DEPTH_PAIRS)
+
+
 def _thickness_from_depth_to_product(
     depth_to_product: object,
     water_depth: float | None,
@@ -1048,6 +1128,17 @@ class DataParser:
 
             if workbook is not None:
                 section_specs = self._parse_sections_sheet(workbook, collars, structure_errors)
+                if water_df is None:
+                    structure_errors.extend(
+                        self._misnamed_sheet_errors(
+                            workbook,
+                            loaded={"Water": bool(water_levels), "Screens": bool(screen_intervals)},
+                            exclude={
+                                (collars_sheet or self.COLLARS_SHEET).strip().lower(),
+                                (lithology_sheet or self.LITHOLOGY_SHEET).strip().lower(),
+                            },
+                        )
+                    )
 
             if lithology_aliases:
                 lithologies = self._apply_lithology_aliases(lithologies, lithology_aliases)
@@ -1133,6 +1224,51 @@ class DataParser:
             return False
         frame = _normalize_columns(read_data_sheet(workbook, sheet))
         return self._frame_has_hole_rows(frame)
+
+    def _misnamed_sheet_errors(
+        self,
+        workbook: pd.ExcelFile,
+        *,
+        loaded: dict[str, bool],
+        exclude: set[str],
+    ) -> list[str]:
+        """Name tabs such as "Water Levels" that hold hole rows but are never read.
+
+        Water and Screens load only from tabs named exactly ``Water`` / ``Screens``;
+        a tab named otherwise was skipped with no message. Reported only when
+        the exact tab is absent and nothing of that kind loaded from elsewhere.
+        """
+        messages: list[str] = []
+        for name in workbook.sheet_names:
+            if name.strip().lower() in exclude:
+                continue
+            words = set(re.findall(r"[a-z]+", name.lower()))
+            targets = {_LOOKALIKE_SHEET_WORDS[word] for word in words & _LOOKALIKE_SHEET_WORDS.keys()}
+            if len(targets) != 1:
+                continue
+            target = targets.pop()
+            if loaded[target] or self._find_sheet(workbook.sheet_names, target) is not None:
+                continue
+            try:
+                frame = _normalize_columns(read_data_sheet(workbook, name))
+            except Exception:  # unreadable tab (chart sheet etc.): not a data sheet
+                continue
+            if not self._frame_has_hole_rows(frame):
+                continue
+            if not _looks_like_lookalike_data(target, words, frame.columns):
+                continue
+            message = (
+                f"The '{name}' sheet was not read: {_LOOKALIKE_SHEET_CONTENT[target]} load only "
+                f"from a sheet named '{target}' — rename the tab to {target}"
+            )
+            columns = set(frame.columns)
+            if target == "Screens" and SCREEN_COLUMNS - columns:
+                missing = ", ".join(sorted(SCREEN_COLUMNS - columns))
+                message += f" and add the {missing} header(s) to row 1"
+            elif target == "Water" and not columns & (WATER_VALUE_COLUMNS | WATER_STATUS_COLUMNS):
+                message += " and add a depth, elevation_masl or status header to row 1"
+            messages.append(message + ".")
+        return messages
 
     @staticmethod
     def _find_sheet(sheet_names: list[str], target: str) -> str | None:
@@ -1293,6 +1429,11 @@ class DataParser:
         for index, row in enumerate(df.itertuples(index=True)):
             row_num = int(row.Index) + 2
             if self._blank_hole_id(row.hole_id):
+                if self._row_has_values(
+                    row,
+                    ("depth", "elevation_masl", "status", "product_thickness_m", "depth_to_product"),
+                ):
+                    errors.append(f"Water row {row_num}: hole_id is blank")
                 continue
             try:
                 hole_id = _clean_text(row.hole_id)
@@ -1410,13 +1551,19 @@ class DataParser:
         frame: pd.DataFrame,
         collars: list[Collar],
     ) -> tuple[list[ScreenInterval], list[str]]:
-        if not SCREEN_COLUMNS.issubset(frame.columns):
+        missing = SCREEN_COLUMNS - set(frame.columns)
+        if missing:
+            # A tab with rows under the wrong headers (top/bottom) was dropped silently.
+            if _frame_has_values(frame):
+                return [], [_missing_columns_message("Screens", missing)]
             return [], []
         valid_hole_ids = {collar.hole_id for collar in collars}
         intervals: list[ScreenInterval] = []
         errors: list[str] = []
         for row_num, row in enumerate(frame.itertuples(index=False), start=2):
             if self._blank_hole_id(getattr(row, "hole_id", None)):
+                if self._row_has_values(row, ("from_depth", "to_depth")):
+                    errors.append(f"Screens row {row_num}: hole_id is blank")
                 continue
             try:
                 interval = ScreenInterval.model_validate(row._asdict())
@@ -1435,13 +1582,18 @@ class DataParser:
         frame: pd.DataFrame,
         collars: list[Collar],
     ) -> tuple[list[VerticalGradient], list[str]]:
-        if not GRADIENT_COLUMNS.issubset(frame.columns):
+        missing = GRADIENT_COLUMNS - set(frame.columns)
+        if missing:
+            if _frame_has_values(frame):
+                return [], [_missing_columns_message("Gradients", missing)]
             return [], []
         valid_hole_ids = {collar.hole_id for collar in collars}
         gradients: list[VerticalGradient] = []
         errors: list[str] = []
         for row_num, row in enumerate(frame.itertuples(index=False), start=2):
             if self._blank_hole_id(getattr(row, "hole_id", None)):
+                if self._row_has_values(row, ("direction",)):
+                    errors.append(f"Gradients row {row_num}: hole_id is blank")
                 continue
             try:
                 gradient = VerticalGradient.model_validate(row._asdict())
@@ -1544,6 +1696,10 @@ class DataParser:
         errors: list[str] = []
         for row_num, row in enumerate(frame.itertuples(index=False), start=2):
             if self._blank_hole_id(getattr(row, "hole_id", None)):
+                if self._row_has_values(
+                    row, ("parameter", "value", "depth", "from_depth", "to_depth")
+                ):
+                    errors.append(f"Environmental row {row_num}: hole_id is blank")
                 continue
             payload = row._asdict()
             # Blank text cells read back as NaN (e.g. from the cleaned export);
@@ -1765,7 +1921,15 @@ class DataParser:
             if pd.isna(row.x_profile) or pd.isna(row.elevation):
                 errors.append(f"Faults sheet: blank x_profile/elevation for fault {row.name!r}")
                 continue
-            faults.setdefault(str(row.name), []).append((float(row.x_profile), float(row.elevation)))
+            try:
+                point = (
+                    _structure_coordinate(row.x_profile, "x_profile"),
+                    _structure_coordinate(row.elevation, "elevation"),
+                )
+            except ValueError as exc:
+                errors.append(f"Faults sheet: {exc} (fault {row.name!r})")
+                continue
+            faults.setdefault(str(row.name), []).append(point)
         return [
             Fault(name=name, trace_points=points)
             for name, points in faults.items()
@@ -1789,9 +1953,15 @@ class DataParser:
                     f"Unconformities sheet: blank x_profile/elevation for surface {row.name!r}"
                 )
                 continue
-            surfaces.setdefault(str(row.name), []).append(
-                (float(row.x_profile), float(row.elevation))
-            )
+            try:
+                point = (
+                    _structure_coordinate(row.x_profile, "x_profile"),
+                    _structure_coordinate(row.elevation, "elevation"),
+                )
+            except ValueError as exc:
+                errors.append(f"Unconformities sheet: {exc} (surface {row.name!r})")
+                continue
+            surfaces.setdefault(str(row.name), []).append(point)
         return [
             Unconformity(name=name, elevation_profile=points)
             for name, points in surfaces.items()

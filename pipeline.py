@@ -56,6 +56,7 @@ from projection import (
     DEFAULT_OFFSET_WARNING_M,
     AlongHoleTVD,
     build_along_hole_tvd,
+    off_transect_warnings,
     project_boreholes,
     transect_azimuth_deg,
 )
@@ -78,6 +79,7 @@ from render_profiles import (
 from render_theme import filter_water_levels_for_plot
 from renderer import CrossSectionRenderer
 from stratigraphy import (
+    OVERRIDE_CODE_CHANGE_PREFIX,
     CorrelationPairSummary,
     GeologicalPolygon,
     PolygonOverlap,
@@ -93,7 +95,8 @@ logger = logging.getLogger(__name__)
 _RENDER_LOCK = RENDER_LOCK
 
 CROSSING_CORRELATION_PREFIX = "Crossing correlation"
-FENCE_NOTE_PREFIXES = (CROSSING_CORRELATION_PREFIX, "Fence clipped")
+# Fence notes Configure preflight shows before Generate (app_services filters on these).
+FENCE_NOTE_PREFIXES = (CROSSING_CORRELATION_PREFIX, "Fence clipped", OVERRIDE_CODE_CHANGE_PREFIX)
 
 
 def _merge_optional_profile_updates(
@@ -333,7 +336,13 @@ def compute_section_geometry(
     ] + clip_warnings
     for message in fence_notes:
         logger.warning(message)
-    overlap_warnings = overlap_warnings + tuple(correlation_warnings) + tuple(fence_notes)
+    # Holes beyond the offset warning distance: Generate shows these, so the
+    # PDF QA page and Word pack must carry them too (same wording as the app).
+    # ``offset_warning_m`` is already in ``geometry_cache_payload``.
+    transect_notes = tuple(off_transect_warnings(collars, transect, offset_warning_m))
+    overlap_warnings = (
+        transect_notes + overlap_warnings + tuple(correlation_warnings) + tuple(fence_notes)
+    )
     if fail_on_overlaps and overlap_pairs:
         raise ValueError(
             f"Polygon overlap detected ({len(overlap_pairs)} pair(s)); "

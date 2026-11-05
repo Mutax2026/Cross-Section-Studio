@@ -6,6 +6,8 @@ import sys
 from io import BytesIO
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -201,3 +203,189 @@ def test_export_cleaned_workbook_bytes_roundtrip() -> None:
     project = load_project_metadata(BytesIO(payload))
     assert project.get("client_name") == "TEST CLIENT"
     assert project.get("figure_preset") == "gwm_fence"
+
+def test_data_entry_hole_ids_that_start_with_a_banner_word_stay_data_rows() -> None:
+    """Review F3: WATER-01 / WATERLOO-2 / PROJECT-7 were read as section banners,
+    dropping the hole and every row beneath it with no error."""
+    import pandas as pd
+
+    from workbook_template import parse_data_entry_sheet
+
+    frame = pd.DataFrame(
+        [
+            ["COLLARS", "", "", "", ""],
+            ["hole_id", "easting", "northing", "elevation", "total_depth"],
+            ["BH-01", 0, 0, 100, 10],
+            ["WATER-01", 10, 0, 100, 10],
+            ["PROJECT-7", 15, 0, 100, 10],
+            ["BH-02", 20, 0, 100, 10],
+            ["LITHOLOGY (required)", "", "", "", ""],
+            ["hole_id", "from_depth", "to_depth", "lithology_code", ""],
+            ["BH-01", 0, 10, "Clay", ""],
+            ["WATER-01", 0, 10, "Clay", ""],
+            ["WATERLOO-2", 0, 10, "Clay", ""],
+            ["Screens-A", 0, 10, "Sand", ""],
+            ["BH-02", 0, 10, "Clay", ""],
+            ["Water (optional)", "", "", "", ""],
+            ["hole_id", "depth", "", "", ""],
+            ["WATER-01", 3, "", "", ""],
+        ]
+    )
+    sheets = parse_data_entry_sheet(frame)
+    assert list(sheets.collars["hole_id"]) == ["BH-01", "WATER-01", "PROJECT-7", "BH-02"]
+    assert list(sheets.lithology["hole_id"]) == [
+        "BH-01",
+        "WATER-01",
+        "WATERLOO-2",
+        "Screens-A",
+        "BH-02",
+    ]
+    assert list(sheets.water["hole_id"]) == ["WATER-01"]
+
+
+def test_data_entry_banners_as_the_template_writes_them_still_open_sections() -> None:
+    """Every banner on the template's Example sheet (same layout as Data Entry)
+    still opens its section after the exact-banner match."""
+    import pandas as pd
+
+    from workbook_template import parse_data_entry_sheet
+
+    workbook = pd.ExcelFile(BytesIO(build_input_template_bytes()))
+    sheets = parse_data_entry_sheet(pd.read_excel(workbook, "Example", header=None))
+    for name in ("collars", "lithology", "water", "environmental", "screens", "gradients"):
+        assert not getattr(sheets, name).empty, name
+    assert sheets.project  # "PROJECT / CLIENT METADATA" block
+
+
+def _data_entry_frame(project: str, collars: str, lithology: str, water: str, extra_rows=()):
+    import pandas as pd
+
+    return pd.DataFrame(
+        [
+            [project, "value", "", "", ""],
+            ["client_name", "Demo", "", "", ""],
+            ["", "", "", "", ""],
+            [collars, "", "", "", ""],
+            ["hole_id", "easting", "northing", "elevation", "total_depth"],
+            ["BH-1", 500000, 6000000, 650, 10],
+            ["BH-2", 500050, 6000000, 651, 12],
+            *extra_rows,
+            ["", "", "", "", ""],
+            [lithology, "", "", "", ""],
+            ["hole_id", "from_depth", "to_depth", "lithology_code", ""],
+            ["BH-1", 0, 5, "Clay", ""],
+            ["BH-1", 5, 10, "Sand", ""],
+            ["BH-2", 0, 12, "Clay", ""],
+            ["", "", "", "", ""],
+            [water, "", "", "", ""],
+            ["hole_id", "depth", "", "", ""],
+            ["BH-1", 3.2, "", "", ""],
+            ["BH-2", 3.5, "", "", ""],
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("project", "collars", "lithology", "water"),
+    [
+        ("PROJECT / CLIENT METADATA", "COLLARS (required)", "LITHOLOGY (required)", "WATER (optional)"),
+        ("PROJECT METADATA", "COLLARS", "LITHOLOGY", "WATER LEVELS"),
+        ("Project", "COLLARS:", "LITHOLOGY:", "WATER:"),
+        ("PROJECT:", "COLLARS (required):", "LITHOLOGY LOG", "Water Levels (optional)"),
+        ("project metadata", "COLLARS - required", "Lithology Log (required)", "Water levels"),
+        ("PROJECT", "Collars — required", "lithology data", "water / levels"),
+        ("PROJECT", "collars ( required )", "LITHOLOGY – optional", "WATER -"),
+        ("PROJECT", "COLLARS:", "Lithology:", "WATER"),
+        ("PROJECT", "COLLARS:", "LITHOLOGY DATA", "WATER"),
+        ("PROJECT", "COLLARS:", "Lithology intervals", "WATER"),
+        ("PROJECT", "COLLARS:", "LITHOLOGY - required", "WATER"),
+    ],
+)
+def test_data_entry_hand_typed_banner_spellings_open_their_sections(
+    project: str, collars: str, lithology: str, water: str
+) -> None:
+    """Review: hand-typed banners ("COLLARS:", "WATER LEVELS", "LITHOLOGY LOG") were
+    read as data rows, so the next header row remapped the previous section."""
+    from workbook_template import parse_data_entry_sheet
+
+    sheets = parse_data_entry_sheet(_data_entry_frame(project, collars, lithology, water))
+    assert sheets.project == {"client_name": "Demo"}
+    assert list(sheets.collars["hole_id"]) == ["BH-1", "BH-2"]
+    assert list(sheets.collars["total_depth"]) == [10, 12]
+    assert list(sheets.lithology["hole_id"]) == ["BH-1", "BH-1", "BH-2"]
+    assert list(sheets.lithology["to_depth"]) == [5, 10, 12]
+    assert list(sheets.water["hole_id"]) == ["BH-1", "BH-2"]
+    assert list(sheets.water["depth"]) == [3.2, 3.5]
+
+
+@pytest.mark.parametrize(
+    "hole_id",
+    [
+        "WATER-01",
+        "WATERLOO-2",
+        "WATER_1",
+        "WATER 1",
+        "Water-A",
+        "PROJECT-7",
+        "Project_7",
+        "COLLARS2",
+        "LITHOLOGY-3",
+        "SCREENS-A",
+        "GRADIENTS1",
+    ],
+)
+def test_data_entry_hole_ids_spelled_like_banners_stay_collar_rows(hole_id: str) -> None:
+    from workbook_template import parse_data_entry_sheet
+
+    frame = _data_entry_frame(
+        "PROJECT / CLIENT METADATA",
+        "COLLARS (required)",
+        "LITHOLOGY (required)",
+        "WATER (optional)",
+        extra_rows=[[hole_id, 500100, 6000000, 652, 8]],
+    )
+    sheets = parse_data_entry_sheet(frame)
+    assert list(sheets.collars["hole_id"]) == ["BH-1", "BH-2", hole_id]
+    assert list(sheets.lithology["hole_id"]) == ["BH-1", "BH-1", "BH-2"]
+    assert list(sheets.water["hole_id"]) == ["BH-1", "BH-2"]
+
+
+@pytest.mark.parametrize("hole_id", ["WATER_1", "WATER 1", "COLLARS2", "PROJECT-7"])
+def test_banner_pattern_rejects_hole_ids_even_without_numbers_beside_them(hole_id: str) -> None:
+    """A hole id typed with its other cells still blank must not open a section."""
+    from workbook_template import _PROJECT_BANNER, _SECTION_BANNERS
+
+    assert not any(p.fullmatch(hole_id) for p in (*_SECTION_BANNERS.values(), _PROJECT_BANNER))
+
+
+def test_data_entry_banner_like_first_cell_beside_numbers_is_a_data_row() -> None:
+    """A hole named "Water Well" logged with coordinates is a collar, not a banner."""
+    from workbook_template import parse_data_entry_sheet
+
+    frame = _data_entry_frame(
+        "PROJECT",
+        "COLLARS",
+        "LITHOLOGY",
+        "WATER",
+        extra_rows=[["Water Well", 500100, 6000000, 652, 8], ["Lithology: pit", 1, 2, 3, 4]],
+    )
+    sheets = parse_data_entry_sheet(frame)
+    assert list(sheets.collars["hole_id"]) == ["BH-1", "BH-2", "Water Well", "Lithology: pit"]
+    assert list(sheets.water["depth"]) == [3.2, 3.5]
+
+
+def test_data_entry_hand_typed_banners_ingest_end_to_end(tmp_path) -> None:
+    """The reviewer's Data-Entry-only workbook: every section loads (no
+    "Missing required sheet(s)")."""
+    import pandas as pd
+
+    frame = _data_entry_frame(
+        "PROJECT / CLIENT METADATA", "COLLARS:", "LITHOLOGY LOG", "Water Levels (optional)"
+    )
+    path = tmp_path / "hand_typed.xlsx"
+    with pd.ExcelWriter(path) as writer:
+        frame.to_excel(writer, sheet_name="Data Entry", header=False, index=False)
+    result, _ = ingest_workbook(path)
+    assert len(result.collars) == 2
+    assert len(result.lithologies) == 3
+    assert len(result.water_levels) == 2

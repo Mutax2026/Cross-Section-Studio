@@ -1211,3 +1211,368 @@ def test_template_without_lithology_sheet_is_rejected_not_loaded_empty() -> None
     book.save(buffer)
     with pytest.raises(ValueError, match=r"Missing required sheet\(s\): Lithology"):
         DataParser().parse_file(BytesIO(buffer.getvalue()))
+
+
+# --- Review 2026-11-05 F4 / F5 / F11: optional-sheet rows are never lost silently ---
+
+
+def test_screens_with_wrong_headers_is_reported_not_dropped() -> None:
+    """F4: a Screens tab headed top/bottom returned no rows and no error."""
+    extra = {"Screens": [{"hole_id": "BH1", "top": 2, "bottom": 5}]}
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert not result.screen_intervals
+    assert any(
+        "Screens sheet is missing the from_depth, to_depth columns" in error
+        for error in result.errors
+    ), result.errors
+    assert len(result.collars) == 2 and len(result.lithologies) == 2
+
+
+def test_header_only_optional_sheets_with_other_headers_stay_quiet() -> None:
+    """No rows under the wrong headers: nothing was lost, so no message."""
+    extra = {
+        "Screens": {"hole_id": [], "top": []},
+        "Gradients": {"hole_id": []},
+    }
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert not result.errors
+
+
+def test_gradients_without_direction_column_is_reported() -> None:
+    extra = {"Gradients": [{"hole_id": "BH1", "dir": "down"}]}
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert not result.vertical_gradients
+    assert any("Gradients sheet is missing the direction column" in e for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    ("sheet", "rows", "expected"),
+    [
+        ("Water Levels", [{"hole_id": "BH1", "depth": 3}], "rename the tab to Water."),
+        ("Groundwater", [{"hole_id": "BH1", "depth": 3}], "rename the tab to Water."),
+        (
+            "Well Screens",
+            [{"hole_id": "BH1", "top": 2, "bottom": 5}],
+            "rename the tab to Screens and add the from_depth, to_depth header(s) to row 1.",
+        ),
+    ],
+)
+def test_misnamed_water_and_screens_tabs_are_named_in_an_error(
+    sheet: str, rows: list[dict], expected: str
+) -> None:
+    """F4: a tab named "Water Levels" was skipped with no message."""
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, {sheet: rows}))
+    assert not result.water_levels and not result.screen_intervals
+    matches = [e for e in result.errors if f"The '{sheet}' sheet was not read" in e]
+    assert len(matches) == 1 and matches[0].endswith(expected), result.errors
+
+
+def test_lookalike_tab_is_not_flagged_when_the_exact_tab_exists() -> None:
+    extra = {
+        "Water": [{"hole_id": "BH1", "depth": 3}],
+        "Water Levels (2019)": [{"hole_id": "BH1", "depth": 9}],
+        "Water Notes": [{"comment": "dipped with tape"}],
+    }
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert len(result.water_levels) == 1 and not result.errors
+
+
+def test_lookalike_tab_without_hole_rows_is_not_flagged() -> None:
+    extra = {"Water Quality Notes": [{"comment": "dipped with tape"}]}
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert not result.errors
+
+
+@pytest.mark.parametrize(
+    ("sheet", "rows"),
+    [
+        ("Water Quality", [{"hole_id": "BH1", "parameter": "Chloride", "value": 10, "unit": "mg/L"}]),
+        ("Groundwater Chemistry", [{"hole_id": "BH1", "Analyte": "Sodium", "Result": 1}]),
+        ("Surface Water", [{"hole_id": "BH1", "sample": "SW1"}]),
+        ("Water chemistry", [{"hole_id": "BH1", "depth": 3, "chloride": 120}]),
+        ("Groundwater Results", [{"hole_id": "BH1", "depth": 3, "parameter": "pH", "value": 7}]),
+        ("Screening Notes", [{"hole_id": "BH1", "note": "a"}]),
+        ("Well Screen Notes", [{"hole_id": "BH1", "note": "slot 10"}]),
+    ],
+)
+def test_chemistry_and_note_tabs_are_not_flagged_as_misnamed(sheet: str, rows: list[dict]) -> None:
+    """Review: lab tabs with hole_id/parameter/value rows were reported as misnamed
+    Water sheets; only tabs whose headers look like water levels / screen depths are."""
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, {sheet: rows}))
+    assert not [e for e in result.errors if "was not read" in e], result.errors
+
+
+@pytest.mark.parametrize(
+    ("sheet", "rows", "target"),
+    [
+        ("Water Levels", [{"hole_id": "BH1", "water_level_m": 3}], "Water"),
+        ("Groundwater Elevations", [{"hole_id": "BH1", "elevation_masl": 97}], "Water"),
+        ("Well Screen Details", [{"hole_id": "BH1", "top": 1, "bottom": 4}], "Screens"),
+        ("Screen Intervals", [{"hole_id": "BH1", "from": 1, "to": 4}], "Screens"),
+    ],
+)
+def test_misnamed_tabs_with_level_or_depth_headers_are_still_flagged(
+    sheet: str, rows: list[dict], target: str
+) -> None:
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, {sheet: rows}))
+    matches = [e for e in result.errors if f"The '{sheet}' sheet was not read" in e]
+    assert len(matches) == 1 and f"rename the tab to {target}" in matches[0], result.errors
+
+
+@pytest.mark.parametrize("sheet", ["Faults", "Unconformities"])
+@pytest.mark.parametrize(
+    ("x_profile", "elevation", "expected"),
+    [
+        ("12 m", 5, "x_profile '12 m' is not a number"),
+        (12, "abc", "elevation 'abc' is not a number"),
+        (True, 5, "x_profile = 'True' is a TRUE/FALSE cell"),
+    ],
+)
+def test_non_numeric_structure_coordinates_are_row_errors(
+    sheet: str, x_profile: object, elevation: object, expected: str
+) -> None:
+    """F5: float("12 m") escaped the row loop and parse_file raised."""
+    rows = [
+        {"name": "S1", "x_profile": x_profile, "elevation": elevation},
+        {"name": "S1", "x_profile": 20, "elevation": 5},
+        {"name": "S2", "x_profile": 0, "elevation": 1},
+        {"name": "S2", "x_profile": 30, "elevation": 2},
+    ]
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, {sheet: rows}))
+    assert len(result.collars) == 2 and len(result.lithologies) == 2
+    assert any(e.startswith(f"{sheet} sheet: {expected}") for e in result.errors), result.errors
+    kept = result.faults if sheet == "Faults" else result.unconformities
+    assert [item.name for item in kept] == ["S2"]
+
+
+def test_blank_hole_id_rows_on_optional_sheets_are_row_errors() -> None:
+    """F11: a Water / Screens / Gradients / Environmental row with data but no
+    hole_id was skipped silently. Fully blank padding rows stay quiet."""
+    blank = {"hole_id": None}
+    extra = {
+        "Water": [
+            {"hole_id": None, "depth": 3},
+            {"hole_id": "BH1", "depth": 4},
+            {"hole_id": None, "depth": None},
+        ],
+        "Screens": [
+            {"hole_id": None, "from_depth": 1, "to_depth": 2},
+            {"hole_id": "BH1", "from_depth": 1, "to_depth": 2},
+            {**blank, "from_depth": None, "to_depth": None},
+        ],
+        "Gradients": [
+            {"hole_id": None, "direction": "down"},
+            {"hole_id": "BH1", "direction": "up"},
+            {**blank, "direction": None},
+        ],
+        "Environmental": [
+            {"hole_id": None, "parameter": "Benzene", "value": 1, "depth": 2},
+            {"hole_id": "BH1", "parameter": "Benzene", "value": 1, "depth": 2},
+            {**blank, "parameter": None, "value": None, "depth": None},
+        ],
+    }
+    result, _ = ingest_workbook(_hostile_workbook(_TWO_COLLARS, _TWO_LITH, extra))
+    assert len(result.water_levels) == 1
+    assert len(result.screen_intervals) == 1
+    assert len(result.vertical_gradients) == 1
+    assert len(result.environmental_readings) == 1
+    assert sorted(result.errors) == sorted(
+        f"{sheet} row 2: hole_id is blank"
+        for sheet in ("Water", "Screens", "Gradients", "Environmental")
+    )
+
+
+# --- Review F2: depth interval units, date cells, row errors -------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("0.5-1.5", (0.5, 1.5)),
+        ("0.00-0.15m", (0.0, 0.15)),
+        ("0.00 - 2.00 m", (0.0, 2.0)),
+        ("0-2 m bgs", (0.0, 2.0)),
+        ("0 m-2 m", (0.0, 2.0)),
+        ("0-2 metres", (0.0, 2.0)),
+        ("0.5–1.5", (0.5, 1.5)),  # en dash
+        ("0.5 — 1.5 m bgl", (0.5, 1.5)),  # em dash
+        # bgs / bgl suffixes, "(m)" and notes with no digits parsed on 067b4a0.
+        ("0-2 m b.g.s.", (0.0, 2.0)),
+        ("0-1.5 m.b.g.", (0.0, 1.5)),
+        ("0-2 mbgs", (0.0, 2.0)),
+        ("0-2 m (bgs)", (0.0, 2.0)),
+        ("0-1.5 (m)", (0.0, 1.5)),
+        ("0 (m) - 1.5 (m)", (0.0, 1.5)),
+        ("0-1.5;", (0.0, 1.5)),
+        ("0-1.5 m,", (0.0, 1.5)),
+        ("1-2 m (fill)", (1.0, 2.0)),
+        ("1-2m approx", (1.0, 2.0)),
+        ("1-2 m b.g.s.", (1.0, 2.0)),
+        ("1-2 m BTOC", (1.0, 2.0)),
+        ("1-2 m;", (1.0, 2.0)),
+        ("0-2 m abc", (0.0, 2.0)),
+        ("0-10 ft", (0.0, 3.048)),
+        ("0-10 (ft)", (0.0, 3.048)),
+        ("0-10 ft bgs", (0.0, 3.048)),
+        ("0-10 feet", (0.0, 3.048)),
+        ("0-10'", (0.0, 3.048)),
+        ("0 ft-10 ft", (0.0, 3.048)),
+    ],
+)
+def test_parse_depth_interval_units_and_dashes(text: str, expected: tuple[float, float]) -> None:
+    top, base = parse_depth_interval(text)
+    assert top == pytest.approx(expected[0])
+    assert base == pytest.approx(expected[1])
+
+
+def test_parse_depth_interval_rejects_dates_mixed_units_and_junk() -> None:
+    import datetime
+
+    # Excel turns "6-1" typed into a General cell into a date.
+    with pytest.raises(ValueError, match="date/time cell.*format the Depth column as Text"):
+        parse_depth_interval(datetime.datetime(2024, 6, 1))
+    with pytest.raises(ValueError, match="date/time cell"):
+        parse_depth_interval(pd.Timestamp("2024-06-01"))
+    with pytest.raises(ValueError, match="mixes units"):
+        parse_depth_interval("0 m-10 ft")
+    for junk in ("1-2-3", "0.5 to 1.5", "", "2", "0-2 m (rev 3)", "1-2 m 3", "abc 0-2", "m 0-2"):
+        with pytest.raises(ValueError, match="cannot parse depth interval"):
+            parse_depth_interval(junk)
+
+
+@pytest.mark.parametrize("text", ["0-1.5 mm", "10-20 mm", "50-150 cm", "0 mm-2 mm", "0-2 millimetres"])
+def test_parse_depth_interval_mm_and_cm_are_typos_not_conversions(text: str) -> None:
+    """Borehole depths are not logged in mm / cm: "0-1.5 mm" means 0-1.5 m."""
+    with pytest.raises(ValueError, match="not logged in (mm|cm).*typo for m"):
+        parse_depth_interval(text)
+
+
+@pytest.mark.parametrize("text", ["0-2 km", "0-24 in", "0-24 inches", '0-24"', "0-3 yd"])
+def test_parse_depth_interval_other_units_are_row_errors_not_metres(text: str) -> None:
+    with pytest.raises(ValueError, match="enter depths in metres"):
+        parse_depth_interval(text)
+
+
+def test_field_export_mm_depth_is_a_row_error() -> None:
+    """Reviewer repro: "0-1.5 mm" became 1.5 mm of clay with no message."""
+    raw = _field_export_bytes(
+        [_lith_row("BH-1", "0-1.5 mm"), _lith_row("BH-1", "1.5-3 m", "sand"), _lith_row("BH-2", "0-2")]
+    )
+    result, _ = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    assert sorted((item.hole_id, item.from_depth, item.to_depth) for item in result.lithologies) == [
+        ("BH-1", 1.5, 3.0),
+        ("BH-2", 0.0, 2.0),
+    ]
+    row_errors = [error for error in result.errors if error.startswith("Lithology row")]
+    assert len(row_errors) == 1 and row_errors[0].startswith("Lithology row 2 (BH-1)")
+    assert "typo for m" in row_errors[0], row_errors
+
+
+def _lith_row(hole: str, depth: object, lithology: str = "clay") -> dict:
+    return {"hole_id": hole, "depth": depth, "lithology": lithology, "lat": 58.57, "long": -119.19}
+
+
+def test_field_export_bad_depth_rows_are_row_errors_not_aborts() -> None:
+    import datetime
+
+    raw = _field_export_bytes(
+        [
+            _lith_row("BH-01", "0-10 ft"),  # row 2
+            _lith_row("BH-01", "10–20 ft", "sand"),  # row 3, en dash
+            _lith_row("BH-01", datetime.datetime(2024, 6, 1)),  # row 4, date cell
+            _lith_row("BH-02", "0-2 m"),  # row 5
+            _lith_row("BH-02", "two to three"),  # row 6
+        ]
+    )
+    result, _ = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    bh1 = sorted(
+        (item.from_depth, item.to_depth) for item in result.lithologies if item.hole_id == "BH-01"
+    )
+    assert bh1 == [pytest.approx((0.0, 3.048)), pytest.approx((3.048, 6.096))]
+    assert {collar.hole_id for collar in result.collars} == {"BH-01", "BH-02"}
+    row_errors = [error for error in result.errors if error.startswith("Lithology row")]
+    assert len(row_errors) == 2
+    assert row_errors[0].startswith("Lithology row 4 (BH-01): depth interval is a date/time cell")
+    assert row_errors[1].startswith("Lithology row 6 (BH-02): cannot parse depth interval")
+
+
+def test_field_export_every_row_bad_returns_errors_not_a_crash() -> None:
+    raw = _field_export_bytes([_lith_row("BH-01", "n/a"), _lith_row("BH-02", "0 m-3 ft")])
+    result, _ = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    assert not result.lithologies
+    assert any(error.startswith("Lithology row 2 (BH-01)") for error in result.errors)
+    assert any("mixes units" in error for error in result.errors)
+
+    adapter = FieldExportAdapter()
+    collars, lithology, _ = adapter.adapt(BytesIO(raw), load_profile("field_export_v1"))
+    assert collars.empty and lithology.empty
+    assert len(adapter.row_errors) == 2
+
+
+def test_export_platform_workbook_refuses_to_drop_bad_rows(tmp_path: Path) -> None:
+    raw = _field_export_bytes([_lith_row("BH-01", "0-2 m"), _lith_row("BH-01", "2-4-6 m")])
+    output = tmp_path / "platform.xlsx"
+    with pytest.raises(ValueError, match=r"(?s)1 lithology row\(s\) could not be read.*Lithology row 3"):
+        export_platform_workbook(BytesIO(raw), output, profile_id="field_export_v1")
+    assert not output.exists()
+
+
+# --- Review F7: Field Data RL lookup -------------------------------------------------
+
+
+def test_field_data_rl_matches_case_insensitively_and_reports_conflicts() -> None:
+    raw = _field_export_bytes(
+        [_lith_row("BH-01", "0-2 m")],
+        extra_sheets={
+            "Field Data": pd.DataFrame(
+                [
+                    {"Label": "bh-01", "elevation": 640.0},
+                    {"Label": "BH-01 ", "elevation": 650.0},
+                    {"Label": "BH-02", "elevation": 700.0},  # no lithology: not applied
+                ]
+            )
+        },
+    )
+    result, report = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    assert [(c.hole_id, c.elevation) for c in result.collars] == [("BH-01", 640.0)]
+    assert "Field Data sheet: applied collar RL for 1 hole(s)." in report.warnings
+    conflict = [w for w in report.warnings if "conflicting collar RLs" in w]
+    assert conflict == [
+        "Field Data rows 2, 3 (bh-01): conflicting collar RLs 640.00 m / 650.00 m — using "
+        "640.00 m from row 2; keep one RL per hole."
+    ]
+    # Every collar took a surveyed RL: no "profile default 100 m" warning.
+    assert not any("profile default" in w for w in report.warnings)
+    assert not report.uses_placeholder_elevation
+
+
+def test_field_data_rl_within_tolerance_is_not_a_conflict() -> None:
+    raw = _field_export_bytes(
+        [_lith_row("BH-01", "0-2 m")],
+        extra_sheets={
+            "Field Data": pd.DataFrame(
+                [{"Label": "BH-01", "elevation": 640.0}, {"Label": "BH-01", "elevation": 640.005}]
+            )
+        },
+    )
+    _, report = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    assert not any("conflicting" in w for w in report.warnings)
+
+
+def test_profile_default_warning_names_only_holes_without_field_data_rl(tmp_path: Path) -> None:
+    raw = _field_export_bytes(
+        [_lith_row("BH-01", "0-2 m"), _lith_row("BH-03", "0-2 m")],
+        extra_sheets={"Field Data": pd.DataFrame([{"Label": "BH-01", "elevation": 640.0}])},
+    )
+    result, report = ingest_workbook(BytesIO(raw), profile_id="field_export_v1")
+    assert {c.hole_id: c.elevation for c in result.collars} == {"BH-01": 640.0, "BH-03": 100.0}
+    defaults = [w for w in report.warnings if "profile default" in w]
+    assert len(defaults) == 1
+    assert "for 1 hole(s) with no Field Data RL (BH-03)" in defaults[0]
+
+    collars, _ = export_platform_workbook(
+        BytesIO(raw), tmp_path / "out.xlsx", profile_id="field_export_v1"
+    )
+    datums = dict(zip(collars["hole_id"], collars["elevation_datum"]))
+    assert datums["BH-01"] is None
+    assert str(datums["BH-03"]).startswith("Placeholder")

@@ -437,18 +437,42 @@ _DENSIFY_MAX_SUBSTEPS = 2000
 # A collar inclination at or below this (degrees from vertical) keeps the hole
 # on the vertical fast path when it has no Deviations rows.
 _VERTICAL_INCLINATION_EPS_DEG = 1e-9
+# A dogleg within this of 180° is a reversal: the two tangents are
+# antiparallel, so the plane of the minimum-curvature arc is undefined (only a
+# horizontal 0° → 180° turn can reach it, since inclination is 0–90°).
+# Measured: the atan2 step keeps the chord length exact (ΔMD·2/π) all the way to
+# 180°, but the arc's plane follows t1 + t2, whose rounding noise (~1e-16, e.g.
+# cos 90° ≠ 0) tilts it by ~1.2e-16/δ rad for δ = 180° − β. At δ = 1e-10 rad that
+# is ~1e-6 rad (≈0.1 mm on a 100 m semicircle); at 1e-14 rad it is metres. A
+# wider band (1e-6 rad, ≈ 0.00006°) collapsed real near-reversals such as
+# 179.99999° to a point instead of a ~63.66 m semicircle chord.
+_REVERSAL_EPS_RAD = 1e-10
 
 
 def _deg_to_rad(value: float) -> float:
     return math.radians(value)
 
 
+def _tangent_sum_and_difference(
+    inc_start_rad: float, azi_start_rad: float, inc_end_rad: float, azi_end_rad: float
+) -> tuple[tuple[float, float, float], float, float]:
+    """(t1 + t2, |t1 + t2|, |t1 − t2|) for the two station tangents."""
+    t_start = _direction_vector(inc_start_rad, azi_start_rad)
+    t_end = _direction_vector(inc_end_rad, azi_end_rad)
+    total = (t_start[0] + t_end[0], t_start[1] + t_end[1], t_start[2] + t_end[2])
+    difference = math.hypot(t_start[0] - t_end[0], t_start[1] - t_end[1], t_start[2] - t_end[2])
+    return total, math.hypot(*total), difference
+
+
 def _dogleg_rad(inc_start_rad: float, azi_start_rad: float, inc_end_rad: float, azi_end_rad: float) -> float:
-    cos_dogleg = (
-        math.cos(inc_end_rad - inc_start_rad)
-        - math.sin(inc_start_rad) * math.sin(inc_end_rad) * (1.0 - math.cos(azi_end_rad - azi_start_rad))
-    )
-    return math.acos(max(-1.0, min(1.0, cos_dogleg)))
+    # 2·atan2(|t1 − t2|, |t1 + t2|) stays accurate near 0 and near 180°, where
+    # acos(t1 · t2) rounds to exactly 0 or π.
+    _, sum_norm, difference = _tangent_sum_and_difference(inc_start_rad, azi_start_rad, inc_end_rad, azi_end_rad)
+    return 2.0 * math.atan2(difference, sum_norm)
+
+
+def _is_reversal(dogleg_rad: float) -> bool:
+    return dogleg_rad > math.pi - _REVERSAL_EPS_RAD
 
 
 def _direction_vector(inc_rad: float, azi_rad: float) -> tuple[float, float, float]:
@@ -473,31 +497,27 @@ def _minimum_curvature_delta(
     inc_end_rad: float,
     azi_end_rad: float,
 ) -> tuple[float, float, float]:
-    """Return (dN, dE, dTVD) between two survey stations using minimum curvature."""
+    """Return (dN, dE, dTVD) between two survey stations using minimum curvature.
+
+    Step = ΔMD/2 · RF · (t1 + t2) with RF = tan(β/2)/(β/2). Using
+    tan(β/2) = |t1 − t2| / |t1 + t2| keeps it finite up to 180°. At a reversal
+    (β ≈ 180°, tangents antiparallel) the arc's plane is undefined and t1 + t2
+    is pure rounding noise, which RF used to blow up into a fake vertical (or
+    lateral) offset; there the step falls back to RF = 1, i.e. ≈ 0.
+    """
     delta_md = md_end - md_start
     if delta_md <= 0.0:
         return 0.0, 0.0, 0.0
 
-    cos_dogleg = (
-        math.cos(inc_end_rad - inc_start_rad)
-        - math.sin(inc_start_rad) * math.sin(inc_end_rad) * (1.0 - math.cos(azi_end_rad - azi_start_rad))
+    total, sum_norm, difference = _tangent_sum_and_difference(
+        inc_start_rad, azi_start_rad, inc_end_rad, azi_end_rad
     )
-    cos_dogleg = max(-1.0, min(1.0, cos_dogleg))
-    dogleg = math.acos(cos_dogleg)
-    if dogleg < 1e-12:
-        ratio_factor = 1.0
+    dogleg = 2.0 * math.atan2(difference, sum_norm)
+    if dogleg < 1e-12 or _is_reversal(dogleg):
+        half = delta_md / 2.0
     else:
-        ratio_factor = 2.0 / dogleg * math.tan(dogleg / 2.0)
-
-    half = delta_md / 2.0 * ratio_factor
-    delta_northing = half * (
-        math.sin(inc_start_rad) * math.cos(azi_start_rad) + math.sin(inc_end_rad) * math.cos(azi_end_rad)
-    )
-    delta_easting = half * (
-        math.sin(inc_start_rad) * math.sin(azi_start_rad) + math.sin(inc_end_rad) * math.sin(azi_end_rad)
-    )
-    delta_tvd = half * (math.cos(inc_start_rad) + math.cos(inc_end_rad))
-    return delta_northing, delta_easting, delta_tvd
+        half = delta_md / dogleg * (difference / sum_norm)
+    return half * total[0], half * total[1], half * total[2]
 
 
 def _collar_orientation_rad(
@@ -524,6 +544,47 @@ def _collar_orientation_rad(
     )
 
 
+def _reading_tangent(reading: DeviationReading) -> tuple[float, float, float]:
+    return _direction_vector(
+        _deg_to_rad(_inclination_from_vertical(reading.inclination_deg)),
+        _deg_to_rad(reading.azimuth_deg),
+    )
+
+
+def _one_reading_per_depth(hole_id: str, readings: Sequence[DeviationReading]) -> list[DeviationReading]:
+    """Depth-sorted readings with one row per measured depth (row order never matters).
+
+    Rows at the same depth that point the same way (e.g. azimuth 0 vs 360,
+    or any azimuth on a vertical shot) collapse silently. Rows that disagree
+    keep the one closest to vertical (smallest inclination, then smallest
+    azimuth in 0–360°) and log a warning naming the depth.
+    """
+    by_depth: dict[float, list[DeviationReading]] = {}
+    for reading in readings:
+        by_depth.setdefault(reading.depth, []).append(reading)
+    kept: list[DeviationReading] = []
+    for depth in sorted(by_depth):
+        group = by_depth[depth]
+        winner = min(
+            group,
+            key=lambda reading: (_inclination_from_vertical(reading.inclination_deg), reading.azimuth_deg % 360.0),
+        )
+        winner_tangent = _reading_tangent(winner)
+        if any(math.dist(_reading_tangent(reading), winner_tangent) > 1e-9 for reading in group):
+            logger.warning(
+                "Hole '%s' has %d Deviations rows at %.2f m that disagree (%s); "
+                "using inclination %g°, azimuth %g° (closest to vertical) — keep one row per depth",
+                hole_id,
+                len(group),
+                depth,
+                "; ".join(f"{r.inclination_deg:g}°/{r.azimuth_deg:g}°" for r in group),
+                winner.inclination_deg,
+                winner.azimuth_deg,
+            )
+        kept.append(winner)
+    return kept
+
+
 def build_minimum_curvature_survey(
     collar: Collar,
     readings: Sequence[DeviationReading],
@@ -534,12 +595,15 @@ def build_minimum_curvature_survey(
 
     Inclination is measured from vertical (0 = straight down), azimuth
     clockwise from grid north. A reading at depth 0 sets the collar
-    orientation (it wins over the Collars sheet angles). The path is extended
-    straight along the last direction to ``max(total_depth, extend_to_md)``.
-    Returned stations are the survey stations only; ``densify_survey`` adds
-    arc points for accurate interpolation between them.
+    orientation (it wins over the Collars sheet angles). Duplicate depths keep
+    one reading (see ``_one_reading_per_depth``). A 180° turn between stations
+    has no defined arc and is drawn with no offset (warned). The path is
+    extended straight along the last direction to
+    ``max(total_depth, extend_to_md)``. Returned stations are the survey
+    stations only; ``densify_survey`` adds arc points for accurate
+    interpolation between them.
     """
-    sorted_readings = sorted(readings, key=lambda reading: reading.depth)
+    sorted_readings = _one_reading_per_depth(collar.hole_id, readings)
     prev_inc, prev_azi = _collar_orientation_rad(collar, sorted_readings)
     stations: list[_SurveyStation] = [
         _SurveyStation(
@@ -561,6 +625,14 @@ def build_minimum_curvature_survey(
             continue
         inc = _deg_to_rad(_inclination_from_vertical(reading.inclination_deg))
         azi = _deg_to_rad(reading.azimuth_deg)
+        if _is_reversal(_dogleg_rad(prev_inc, prev_azi, inc, azi)):
+            logger.warning(
+                "Hole '%s' survey turns 180° between %.2f m and %.2f m; the bend direction "
+                "is undefined, so that interval is drawn with no offset — check the azimuths",
+                collar.hole_id,
+                prev_md,
+                reading.depth,
+            )
         delta_n, delta_e, delta_tvd = _minimum_curvature_delta(
             prev_md, prev_inc, prev_azi, reading.depth, inc, azi
         )
@@ -619,7 +691,8 @@ def densify_survey(stations: Sequence[_SurveyStation]) -> list[_SurveyStation]:
     for start, end in zip(stations[:-1], stations[1:], strict=True):
         delta_md = end.measured_depth - start.measured_depth
         dogleg = _dogleg_rad(start.inclination_rad, start.azimuth_rad, end.inclination_rad, end.azimuth_rad)
-        if delta_md <= 0.0 or dogleg < 1e-9:
+        if delta_md <= 0.0 or dogleg < 1e-9 or _is_reversal(dogleg):
+            # Straight, or a 180° reversal (no defined arc; the step is ≈ 0).
             dense.append(end)
             continue
         substeps = max(
@@ -630,14 +703,12 @@ def densify_survey(stations: Sequence[_SurveyStation]) -> list[_SurveyStation]:
         substeps = min(substeps, _DENSIFY_MAX_SUBSTEPS)
         t_start = _direction_vector(start.inclination_rad, start.azimuth_rad)
         t_end = _direction_vector(end.inclination_rad, end.azimuth_rad)
+        # ≥ ~1e-10: near-zero doglegs and reversals were skipped above.
         sin_dogleg = math.sin(dogleg)
         for step in range(1, substeps):
             fraction = step / substeps
-            if sin_dogleg > 1e-12:
-                weight_a = math.sin((1.0 - fraction) * dogleg) / sin_dogleg
-                weight_b = math.sin(fraction * dogleg) / sin_dogleg
-            else:  # antiparallel tangents (180° dogleg): degenerate, fall back to lerp
-                weight_a, weight_b = 1.0 - fraction, fraction
+            weight_a = math.sin((1.0 - fraction) * dogleg) / sin_dogleg
+            weight_b = math.sin(fraction * dogleg) / sin_dogleg
             north = weight_a * t_start[0] + weight_b * t_end[0]
             east = weight_a * t_start[1] + weight_b * t_end[1]
             down = weight_a * t_start[2] + weight_b * t_end[2]

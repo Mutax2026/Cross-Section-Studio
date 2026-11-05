@@ -36,6 +36,14 @@ def test_normalize_lithology_sand_not_remapped_to_sandstone() -> None:
     assert normalize_lithology_code("sst", aliases) == "Sandstone"
 
 
+def test_normalize_lithology_clay_fill_is_fill_not_in_situ_clay() -> None:
+    """Fill logged as "clay fill" must keep the Fill code, not hatch as Clay."""
+    aliases = load_lithology_aliases()
+    assert normalize_lithology_code("clay fill", aliases) == "Fill"
+    assert normalize_lithology_code("Clay Fill", aliases) == "Fill"
+    assert normalize_lithology_code("clay", aliases) == "Clay"
+
+
 def test_fuzzy_column_mapping() -> None:
     mappings = propose_column_mappings(
         ["BH", "East", "North", "RL", "TD"],

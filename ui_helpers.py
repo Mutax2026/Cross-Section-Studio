@@ -531,7 +531,8 @@ def export_metadata_payload(
         ),
         "hole_count": hole_count,
         "transect_label": transect_label,
-        "qa_notes": list(overlap_warnings[:20]),
+        # Every note, as on the PDF QA page (a cap at 20 dropped the rest unseen).
+        "qa_notes": list(overlap_warnings),
         "generated_by": APP_NAME,
         "created_by": CREATED_BY,
         "copyright": COPYRIGHT_NOTICE,

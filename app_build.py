@@ -14,11 +14,9 @@ from models import (
     ConsultingTitleBlock,
     Lithology,
     ParseResult,
-    Transect,
     subset_parse_result,
 )
 from pipeline import section_groundwater_flow_notes
-from projection import off_transect_warnings
 from render_profiles import ChemistryLabelStyle
 from section_build_request import SectionBuildRequest
 from ui_helpers import dedupe_messages, holes_missing_lithology, screen_interval_warnings
@@ -359,22 +357,13 @@ def generate_cross_section(
             "Missing lithology for hole(s): " + ", ".join(missing_lithology)
         )
 
-    transect = Transect(points=transect_points)
     preflight_key = st.session_state.get("_preflight_json_key")
     transect_points_tuple = tuple(transect_points)
-    # Configure already ran off-transect warnings for the same holes/transect/threshold.
-    skip_off_transect = (
-        isinstance(preflight_key, tuple)
-        and len(preflight_key) >= 9
-        and preflight_key[0] == tuple(hole_ids)
-        and preflight_key[1] == transect_points_tuple
-        and preflight_key[5] == offset_warning_m
-        and preflight_key[7] == st.session_state.get("file_hash")
-        and preflight_key[8] == st.session_state.get("parse_signature")
-    )
+    # Off-transect holes ("BH-01 is 5.0 m from transect ...") come back in the
+    # pipeline's section notes (shown below the downloads and on the PDF QA
+    # page); a separate st.warning here printed each one twice. The request
+    # carries the same ``offset_warning_m``.
     warnings: list[str] = []
-    if not skip_off_transect:
-        warnings.extend(off_transect_warnings(subset.collars, transect, offset_warning_m))
     if request.render_layout in {"consulting_section", "section_sheet"}:
         warnings.extend(screen_interval_warnings(hole_ids, subset.screen_intervals))
     if warnings:

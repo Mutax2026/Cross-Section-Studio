@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from chemistry_qc import (
     mixed_unit_warnings,
     rdl_above_guideline_notes,
 )
+from chemistry_qc import threshold_units as limits_units_of
 from constants import CANONICAL_LITHOLOGY_CODES
 from hydro_metrics import (
     APPARENT_LNAPL_THICKNESS_WARN_M,
@@ -640,11 +642,65 @@ def _horizontal_hole_issue(hole_id: str, where: str) -> QualityIssue:
     )
 
 
+def _survey_inclination_from_vertical(inc_deg: float) -> float:
+    """Mirror of ``projection._inclination_from_vertical`` (−90 mining dip = straight down)."""
+    return 90.0 + inc_deg if -90.0 <= inc_deg < 0.0 else inc_deg
+
+
+def _survey_tangent(reading: DeviationReading) -> tuple[float, float, float]:
+    """Unit hole direction (north, east, down), as ``projection._reading_tangent``."""
+    inc = math.radians(_survey_inclination_from_vertical(reading.inclination_deg))
+    azi = math.radians(reading.azimuth_deg)
+    return math.sin(inc) * math.cos(azi), math.sin(inc) * math.sin(azi), math.cos(inc)
+
+
+# Same threshold as ``projection._one_reading_per_depth``: rows closer than this
+# point the same way (azimuth 0 vs 360, any azimuth on a vertical shot) and
+# collapse silently there, so Validate stays quiet about them too.
+_SAME_SURVEY_DIRECTION_TOL = 1e-9
+
+
+def _duplicate_survey_depth_issues(hole_id: str, readings: Sequence[DeviationReading]) -> list[QualityIssue]:
+    """Deviations rows at one depth that disagree (projection keeps the most vertical)."""
+    by_depth: dict[float, list[DeviationReading]] = {}
+    for reading in readings:
+        by_depth.setdefault(reading.depth, []).append(reading)
+    issues: list[QualityIssue] = []
+    for depth in sorted(by_depth):
+        group = by_depth[depth]
+        if len(group) < 2:
+            continue
+        # Same winner as projection: smallest inclination from vertical, then azimuth.
+        drawn = min(
+            group,
+            key=lambda r: (_survey_inclination_from_vertical(r.inclination_deg), r.azimuth_deg % 360.0),
+        )
+        drawn_tangent = _survey_tangent(drawn)
+        if all(math.dist(_survey_tangent(r), drawn_tangent) <= _SAME_SURVEY_DIRECTION_TOL for r in group):
+            continue
+        shown = "; ".join(f"{r.inclination_deg:g}°/{r.azimuth_deg:g}°" for r in group)
+        issues.append(
+            QualityIssue(
+                code="duplicate_survey_depth",
+                message=(
+                    f"{hole_id}: {len(group)} Deviations rows at {_m(depth)} m disagree "
+                    f"(inclination/azimuth {shown}) — the section draws inclination "
+                    f"{drawn.inclination_deg:g}°, azimuth {drawn.azimuth_deg:g}° (closest to "
+                    "vertical); keep one row per depth"
+                ),
+                severity=Severity.WARNING.value,
+                hole_id=hole_id,
+            )
+        )
+    return issues
+
+
 def survey_quality_issues(
     collars: Sequence[Collar],
     deviation_readings: Sequence[DeviationReading] | None,
 ) -> list[QualityIssue]:
-    """Horizontal (90°) holes / survey stations and Deviations rows with no collar."""
+    """Horizontal (90°) holes / survey stations, conflicting rows at one depth, and
+    Deviations rows with no collar."""
     issues: list[QualityIssue] = []
     collar_ids = {collar.hole_id for collar in collars}
     for collar in collars:
@@ -652,16 +708,20 @@ def survey_quality_issues(
         if collar.inclination_deg == 90.0:
             issues.append(_horizontal_hole_issue(collar.hole_id, "on Collars"))
     horizontal: dict[str, list[float]] = {}
+    by_hole: dict[str, list[DeviationReading]] = {}
     orphans: dict[str, int] = {}
     for reading in deviation_readings or ():
         if reading.hole_id not in collar_ids:
             orphans[reading.hole_id] = orphans.get(reading.hole_id, 0) + 1
             continue
+        by_hole.setdefault(reading.hole_id, []).append(reading)
         if reading.inclination_deg == 90.0:
             horizontal.setdefault(reading.hole_id, []).append(reading.depth)
     for hole_id, depths in horizontal.items():
         shown = ", ".join(f"{_m(depth)} m" for depth in sorted(depths)[:5])
         issues.append(_horizontal_hole_issue(hole_id, f"on Deviations at {shown}"))
+    for hole_id, hole_readings in by_hole.items():
+        issues.extend(_duplicate_survey_depth_issues(hole_id, hole_readings))
     if orphans:
         listed = ", ".join(f"{hole} ({count})" for hole, count in sorted(orphans.items()))
         issues.append(
@@ -1578,6 +1638,7 @@ def summarize_environmental_readings(
     hole_ids_on_transect: Sequence[str],
     *,
     thresholds: Mapping[str, tuple[float | None, float | None]] | None = None,
+    threshold_units: Mapping[str, str] | None = None,
 ) -> EnvironmentalQualitySummary:
     """Summarize lab/parameter coverage for Validate UI.
 
@@ -1586,6 +1647,12 @@ def summarize_environmental_readings(
     ``green_max`` values) and parameters reported in more than one unit,
     negative concentrations, inverted colour bands (green above orange) and
     samples far below their hole (left off the figure).
+
+    ``threshold_units`` (parameter -> unit) names the unit the limits are in;
+    default: the main unit of all ``readings`` (``chemistry_qc.threshold_units``),
+    the basis the workbook limits are read in. The non-detect check converts
+    each detection limit to it, though it looks only at the latest on-line
+    samples, which may favour another unit.
     """
     transect_holes = tuple(hole_ids_on_transect)
     hole_set = set(transect_holes)
@@ -1650,10 +1717,14 @@ def summarize_environmental_readings(
     warnings.extend(negative_concentration_warnings(on_line))
     if thresholds is None:
         thresholds = chemistry_thresholds_from_readings(readings)
+    if threshold_units is None:
+        # Same reading set as the workbook limits: every row, off-line holes
+        # and superseded dates included.
+        threshold_units = limits_units_of(readings)
     warnings.extend(chemistry_threshold_inversion_warnings(thresholds))
     warnings.extend(f"Info: {note}" for note in orange_only_limit_notes(thresholds))
     # Only the samples the figure draws (superseded dates are not plotted).
-    warnings.extend(rdl_above_guideline_notes(latest_on_line, thresholds))
+    warnings.extend(rdl_above_guideline_notes(latest_on_line, thresholds, threshold_units))
     warnings.extend(lab_qualifier_warnings(latest_on_line))
 
     if not readings and transect_holes:

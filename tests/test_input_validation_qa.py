@@ -311,6 +311,58 @@ def test_absurd_lithology_depth_is_a_row_error() -> None:
     lith, errors = DataParser()._parse_lithologies(frame, _collars())
     assert not lith
     assert errors[0].startswith("Lithology row 2 (MW-01): to_depth 250000 is out of range")
+    assert "date serial" not in errors[0]
+
+
+def test_date_serial_lithology_depth_is_a_row_error_with_a_date_hint() -> None:
+    """Review F8: 44927 (Excel serial for 2023-01-01) was a legal to_depth."""
+    frame = pd.DataFrame(
+        [
+            {"hole_id": "MW-01", "from_depth": 0, "to_depth": 5, "lithology_code": "SAND"},
+            {"hole_id": "MW-01", "from_depth": 5, "to_depth": 44927, "lithology_code": "CLAY"},
+        ]
+    )
+    lith, errors = DataParser()._parse_lithologies(frame, _collars())
+    assert [(item.from_depth, item.to_depth) for item in lith] == [(0.0, 5.0)]
+    assert len(errors) == 1
+    assert errors[0].startswith(
+        "Lithology row 3 (MW-01): to_depth 44927 is out of range (limit 15,000 m)"
+    )
+    assert "Excel date serial" in errors[0]
+
+
+@pytest.mark.parametrize("depth", [16_000.0, 44_927.0, 99_000.0])
+def test_collar_total_depth_past_15_km_is_out_of_range(depth: float) -> None:
+    with pytest.raises(ValidationError, match="total_depth .* is out of range") as info:
+        Collar(hole_id="A", easting=0, northing=0, elevation=100, total_depth=depth)
+    assert ("Excel date serial" in str(info.value)) == (20_000 <= depth <= 80_000)
+
+
+def test_deep_holes_stay_clean() -> None:
+    """A few-km hole is well inside the plausibility bound."""
+    collar = Collar(hole_id="A", easting=0, northing=0, elevation=100, total_depth=4_500)
+    lith = Lithology(hole_id="A", from_depth=3_000, to_depth=12_262, lithology_code="GRANITE")
+    assert collar.total_depth == 4_500
+    assert lith.to_depth == 12_262
+
+
+def test_field_export_date_serial_interval_does_not_sink_the_hole() -> None:
+    """The inferred collar TD skips the implausible interval, so only that row fails."""
+    from ingestion import ingest_workbook
+
+    rows = [
+        {"Label": "BH-01", "Depth": "0-2 m", "Lithology": "clay", "Lat": 58.57, "Long": -119.19},
+        {"Label": "BH-01", "Depth": "2-44927", "Lithology": "sand", "Lat": 58.57, "Long": -119.19},
+    ]
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame(rows).to_excel(writer, sheet_name="Lithology", index=False)
+    result, _ = ingest_workbook(BytesIO(buffer.getvalue()), profile_id="field_export_v1")
+    assert [(c.hole_id, c.total_depth) for c in result.collars] == [("BH-01", 2.0)]
+    assert [(item.from_depth, item.to_depth) for item in result.lithologies] == [(0.0, 2.0)]
+    assert len(result.errors) == 1
+    assert "to_depth 44927 is out of range" in result.errors[0]
+    assert "Excel date serial" in result.errors[0]
 
 
 def _workbook(sheets: dict[str, list[list[object]]]) -> BytesIO:

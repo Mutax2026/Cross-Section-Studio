@@ -527,3 +527,67 @@ def test_depth_axis_does_not_carry_masl_label_or_note() -> None:
         assert any("METRES BELOW GROUND SURFACE" in t.upper() for t in texts)
     finally:
         plt.close(fig)
+
+
+# --- (7) placeholder collar elevation is flagged on the consulting sheet -----
+
+
+def _note_texts(figure) -> list[str]:
+    return [t.get_text() for t in _drawn_texts(figure) if t.get_text()[:1].isdigit()]
+
+
+@pytest.mark.parametrize("placeholder", [True, False])
+def test_placeholder_collar_elevation_warning_in_consulting_notes(two_hole_section, placeholder: bool) -> None:
+    """The section sheet's metadata footer says "WARNING: placeholder collar
+    elevation"; the consulting sheet has no such footer and printed nothing,
+    so a figure on default collar RLs looked surveyed."""
+    import matplotlib.pyplot as plt
+
+    from models import SectionFigureMetadata
+
+    projected, polygons, collar_depths = two_hole_section
+    # Four template notes: only the first four notes are drawn, and the
+    # warning must not be the one cut.
+    block = ConsultingTitleBlock(
+        section_label="A-A'", notes=("NOTE ONE.", "NOTE TWO.", "NOTE THREE.", "NOTE FOUR.")
+    )
+    renderer = CrossSectionRenderer(
+        show_legend=False,
+        render_profile=CONSULTING_SECTION_PROFILE,
+        consulting_title_block=block,
+        figure_metadata=SectionFigureMetadata(hole_count=2, uses_placeholder_elevation=placeholder),
+    )
+    figure = renderer.render(polygons, projected, collar_depths=collar_depths)
+    try:
+        figure.draw_without_rendering()
+        flagged = [t for t in _note_texts(figure) if "PLACEHOLDER COLLAR ELEVATION" in t.upper()]
+        assert bool(flagged) is placeholder, _note_texts(figure)
+    finally:
+        plt.close(figure)
+
+
+def test_placeholder_collar_elevation_warning_reaches_consulting_exports() -> None:
+    """PNG/PDF/SVG (and so the Word pack, which embeds the PNG) carry the warning."""
+    from io import BytesIO
+
+    from pypdf import PdfReader
+
+    from models import Collar, Lithology, SectionFigureMetadata
+    from pipeline import build_cross_section
+
+    collars = [
+        Collar(hole_id=h, easting=10.0 * i, northing=0.0, elevation=100.0, total_depth=6.0)
+        for i, h in enumerate(("BH-1", "BH-2", "BH-3"))
+    ]
+    liths = [Lithology(hole_id=c.hole_id, from_depth=0.0, to_depth=6.0, lithology_code="Sand") for c in collars]
+    result = build_cross_section(
+        collars,
+        liths,
+        [(0.0, 0.0), (20.0, 0.0)],
+        render_layout="consulting_section",
+        figure_metadata=SectionFigureMetadata(hole_count=3, uses_placeholder_elevation=True),
+        export_formats=frozenset({"svg", "pdf"}),
+    )
+    pdf_text = " ".join(p.extract_text() or "" for p in PdfReader(BytesIO(result.pdf_bytes)).pages)
+    assert "PLACEHOLDER COLLAR ELEVATION" in pdf_text.upper()
+    assert b"PLACEHOLDER COLLAR ELEVATION" in result.svg_bytes.upper()

@@ -325,7 +325,10 @@ def _render_batch_export(
                 # One sheet size throughout: tight section pages and letter
                 # text pages are fitted onto letter landscape.
                 binder_pdf=export_binder_pdf(
-                    [normalize_pdf_pages(pdf) for pdf in pdfs], cover_title=cover_title
+                    [normalize_pdf_pages(pdf) for pdf in pdfs],
+                    cover_title=cover_title,
+                    # DRAFT on the cover too when the sections carry it.
+                    export_framing=base_request.export_framing,
                 )
                 or None,
             )

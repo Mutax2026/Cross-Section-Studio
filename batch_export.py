@@ -13,8 +13,8 @@ from io import BytesIO
 
 from matplotlib.backends.backend_pdf import PdfPages
 
-from export_framing import _sanitize_stem
-from models import Collar, ConsultingTitleBlock, ParseResult
+from export_framing import ExportFramingConfig, _sanitize_stem, apply_draft_watermark
+from models import Collar, ConsultingTitleBlock, ParseResult, SectionFigureMetadata
 from parse_ops import subset_parse_result
 from pipeline import (
     SectionGeometry,
@@ -423,6 +423,36 @@ def prepare_batch_section_request(
     return subset, request
 
 
+def batch_figure_metadata(
+    subset: ParseResult,
+    request: SectionBuildRequest,
+) -> SectionFigureMetadata:
+    """Sheet metadata (CRS, datum, placeholder-RL flag) for one batch section.
+
+    Same rules as the Generate path (``app_services._build_section_kwargs``,
+    which this module cannot import: it pulls in Streamlit). The request's
+    ``figure_metadata`` is never set by the app, so passing it straight
+    through dropped the placeholder-elevation warning and CRS/datum from
+    every batch sheet.
+    """
+    if request.figure_metadata is not None:
+        return request.figure_metadata
+    elevation_datum = next(
+        (collar.elevation_datum for collar in subset.collars if collar.elevation_datum),
+        "Collar RL",
+    )
+    if request.elevation_mode == "relative":
+        elevation_datum = "Depth below collar (relative)"
+    return SectionFigureMetadata(
+        coordinate_reference=request.coordinate_reference,
+        elevation_datum=elevation_datum,
+        vertical_exaggeration=request.vertical_exaggeration,
+        hole_count=len(subset.collars),
+        uses_placeholder_elevation=request.uses_placeholder_elevation
+        and request.elevation_mode == "absolute",
+    )
+
+
 def build_one_transect_exports(
     parse_result: ParseResult,
     base_request: SectionBuildRequest,
@@ -475,7 +505,7 @@ def build_one_transect_exports(
         faults=request.faults,
         unconformities=request.unconformities,
         environmental_readings=request.environmental_readings,
-        figure_metadata=request.figure_metadata,
+        figure_metadata=batch_figure_metadata(subset, request),
         show_ground_surface=request.show_ground_surface,
         interpolate_water_table=request.interpolate_water_table,
         show_water_elevation_labels=request.show_water_elevation_labels,
@@ -543,12 +573,22 @@ def build_multi_transect_exports(
 _LETTER_LANDSCAPE_IN = (11.0, 8.5)
 
 
-def _cover_page_pdf(title: str, subtitle: str, *, page_size_in: tuple[float, float]) -> bytes:
+def _cover_page_pdf(
+    title: str,
+    subtitle: str,
+    *,
+    page_size_in: tuple[float, float],
+    export_framing: ExportFramingConfig | None = None,
+) -> bytes:
     """One cover page at exactly ``page_size_in`` (no tight bbox: that cropped
-    the page to the text, a non-standard ~489 x 624 pt sheet)."""
+    the page to the text, a non-standard ~489 x 624 pt sheet).
+
+    Stamped DRAFT, like the section sheets behind it, when the framing asks.
+    """
     buffer = BytesIO()
     with PdfPages(buffer) as pdf:
         cover = new_figure(page_size_in)
+        apply_draft_watermark(cover, export_framing)
         ax = cover.add_subplot()
         ax.axis("off")
         ax.text(
@@ -567,7 +607,12 @@ def _cover_page_pdf(title: str, subtitle: str, *, page_size_in: tuple[float, flo
     return buffer.getvalue()
 
 
-def _merge_pdfs_pypdf(section_pdfs: Sequence[bytes], *, cover_title: str) -> bytes | None:
+def _merge_pdfs_pypdf(
+    section_pdfs: Sequence[bytes],
+    *,
+    cover_title: str,
+    export_framing: ExportFramingConfig | None = None,
+) -> bytes | None:
     try:
         from pypdf import PdfReader, PdfWriter
     except ImportError:
@@ -580,7 +625,10 @@ def _merge_pdfs_pypdf(section_pdfs: Sequence[bytes], *, cover_title: str) -> byt
         box = readers[0].pages[0].mediabox
         page_size_in = (float(box.width) / 72.0, float(box.height) / 72.0)
     cover = _cover_page_pdf(
-        cover_title, f"{len(section_pdfs)} section(s)", page_size_in=page_size_in
+        cover_title,
+        f"{len(section_pdfs)} section(s)",
+        page_size_in=page_size_in,
+        export_framing=export_framing,
     )
     writer.append(PdfReader(BytesIO(cover)))
     for reader in readers:
@@ -590,14 +638,23 @@ def _merge_pdfs_pypdf(section_pdfs: Sequence[bytes], *, cover_title: str) -> byt
     return out.getvalue()
 
 
-def export_binder_pdf(section_pdfs: Sequence[bytes], *, cover_title: str = "Cross Section Report") -> bytes:
-    """Combine prepared single-section PDF bytes into one binder document."""
+def export_binder_pdf(
+    section_pdfs: Sequence[bytes],
+    *,
+    cover_title: str = "Cross Section Report",
+    export_framing: ExportFramingConfig | None = None,
+) -> bytes:
+    """Combine prepared single-section PDF bytes into one binder document.
+
+    ``export_framing`` is the batch's framing: with ``show_draft_watermark``
+    on, the cover page is stamped DRAFT like the section sheets.
+    """
     valid = [payload for payload in section_pdfs if payload]
     if not valid:
         return b""
     if len(valid) == 1 or len({payload for payload in valid}) == 1:
         return valid[0]
-    merged = _merge_pdfs_pypdf(valid, cover_title=cover_title)
+    merged = _merge_pdfs_pypdf(valid, cover_title=cover_title, export_framing=export_framing)
     if merged is not None:
         return merged
     # Fallback without pypdf: cover page only (individual PDFs still land in the ZIP).
@@ -605,6 +662,7 @@ def export_binder_pdf(section_pdfs: Sequence[bytes], *, cover_title: str = "Cros
         cover_title,
         f"{len(valid)} section(s) — install pypdf for full binder merge",
         page_size_in=_LETTER_LANDSCAPE_IN,
+        export_framing=export_framing,
     )
 
 

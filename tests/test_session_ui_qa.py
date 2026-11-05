@@ -269,10 +269,15 @@ def test_drawn_ve_is_read_from_a_real_auto_ve_figure() -> None:
         vertical_exaggeration=None, show_ve_annotation=True,
         export_formats=frozenset({"svg", "pdf"}),
     )
+    assert result.pdf_bytes, "PDF export was requested but not produced"
     from_pdf = drawn_vertical_exaggeration(pdf_bytes=result.pdf_bytes)
     from_svg = drawn_vertical_exaggeration(svg_bytes=result.svg_bytes)
     assert from_svg is not None and from_svg.endswith("×")
-    assert from_pdf in (None, from_svg) or from_pdf.endswith("×")
+    # The PDF is the deliverable the metadata reads first, so it must print the
+    # same scale as the SVG. None means the PDF caption could not be read
+    # (pypdf missing or the caption dropped): that is a failure, not a pass.
+    assert from_pdf is not None, "VE caption not readable from the PDF"
+    assert from_pdf == from_svg
 
 
 # --- 4. Next-step hint -------------------------------------------------------------

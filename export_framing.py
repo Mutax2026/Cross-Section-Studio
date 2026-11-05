@@ -142,21 +142,30 @@ def export_figsize_in(
     return None
 
 
+# Windows device names. COM/LPT take 0–9 and the ISO 8859-1 superscript
+# digits ¹ ² ³, which Windows also reads as digits (and ``\w`` keeps).
+_WINDOWS_PORT_DIGITS = "0123456789¹²³"
 _WINDOWS_RESERVED_STEMS = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{i}" for i in range(1, 10)}
-    | {f"LPT{i}" for i in range(1, 10)}
+    | {f"COM{d}" for d in _WINDOWS_PORT_DIGITS}
+    | {f"LPT{d}" for d in _WINDOWS_PORT_DIGITS}
 )
 
 
 def avoid_windows_reserved_name(stem: str) -> str:
-    """Append ``_`` to stems Windows reserves for devices (``CON``, ``LPT1`` …).
+    """Add ``_`` after a device name Windows reserves (``CON``, ``COM0``, ``LPT¹`` …).
 
     ``CON.svg`` can't be created on Windows (the desktop build saves to a
-    project folder) and confuses ZIP extractors there.
+    project folder) and confuses ZIP extractors there. Windows matches the
+    text before the first dot, ignoring trailing spaces, so ``CON .tar``
+    is reserved too; the ``_`` goes right after the device name
+    (``CON.tar`` → ``CON_.tar``) because ``CON.tar_`` would still be.
     """
-    base = stem.split(".", 1)[0]
-    return f"{stem}_" if base.upper() in _WINDOWS_RESERVED_STEMS else stem
+    head, dot, tail = stem.partition(".")
+    base = head.rstrip(" ")
+    if base.upper() not in _WINDOWS_RESERVED_STEMS:
+        return stem
+    return f"{base}_{head[len(base):]}{dot}{tail}"
 
 
 def sanitize_filename_stem(text: str, *, fallback: str = "cross_section") -> str:
@@ -470,11 +479,21 @@ def prepare_export_figure(
     apply_viewport_crop(fig, framing)
 
 
+DRAFT_WATERMARK_GID = "draft-watermark"
+
+
 def apply_draft_watermark(fig, framing: ExportFramingConfig | None) -> None:
-    """Overlay a semi-transparent DRAFT stamp on raster/PDF exports."""
+    """Overlay a semi-transparent DRAFT stamp on raster/PDF exports.
+
+    Idempotent: the stamp is tagged with ``DRAFT_WATERMARK_GID`` and not drawn
+    again on a figure that already has it (each export of the same figure used
+    to stack one more DRAFT artist).
+    """
     if framing is None or not framing.show_draft_watermark:
         return
-    fig.text(
+    if any(text.get_gid() == DRAFT_WATERMARK_GID for text in fig.texts):
+        return
+    stamp = fig.text(
         0.5,
         0.5,
         "DRAFT",
@@ -487,6 +506,7 @@ def apply_draft_watermark(fig, framing: ExportFramingConfig | None) -> None:
         transform=fig.transFigure,
         zorder=1000,
     )
+    stamp.set_gid(DRAFT_WATERMARK_GID)
 
 
 # Matplotlib set_gid / SVG id values promoted to Inkscape layers when CAD toggle is on.
