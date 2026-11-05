@@ -392,3 +392,63 @@ def test_redact_secrets_leaves_ordinary_text_alone(text: str) -> None:
     from ops_logging import redact_secrets
 
     assert redact_secrets(text) == text
+
+
+from ops_logging import redact_secrets  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"token": "' + "\\" * 40 + "\n",
+        "{'secret': '" + "C:\\data\\\\" * 200,
+        "password='" + "\\" * 60,
+        "x" * 100_000,
+    ],
+    ids=["json-backslashes", "dict-windows-path", "password-backslashes", "100kb-plain"],
+)
+def test_redact_secrets_runs_in_linear_time_on_unclosed_quotes(line: str) -> None:
+    """A secret-named key with backslashes and no closing quote must not hang logging."""
+    import time
+
+    start = time.perf_counter()
+    redact_secrets(line)
+    assert time.perf_counter() - start < 0.5
+
+
+@pytest.mark.parametrize(
+    ("raw", "secret", "expected"),
+    [
+        ('password="with space SECRET"', "SECRET", "password=[redacted]"),
+        ("passwd=X1secret", "X1secret", "passwd=[redacted]"),
+        ("key=SECRETQS&page=2", "SECRETQS", "key=[redacted]&page=2"),
+        ("https://user:pa55@host/x", "pa55", "https://user:[redacted]@host/x"),
+        ("Cookie: session=S3SS; a=b", "S3SS", "Cookie: [redacted]"),
+        ("Bearer: tok.en+/=", "tok.en", "Bearer: [redacted]"),
+        ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz", "Authorization: Basic [redacted]"),
+    ],
+)
+def test_redact_secrets_more_shapes(raw: str, secret: str, expected: str) -> None:
+    out = redact_secrets(raw)
+    assert secret not in out
+    assert out == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Authorization: Bearer abc.def",
+        "Authorization: Basic dXNlcjpwYXNz",
+        "Cookie: session=X; a=b",
+        '{"api_key": "k"} password=p ?token=t&page=2',
+    ],
+)
+def test_redact_secrets_is_idempotent(raw: str) -> None:
+    """Log records pass through the filter and the formatter; two passes must agree."""
+    once = redact_secrets(raw)
+    assert redact_secrets(once) == once
+
+
+@pytest.mark.parametrize("raw", ["SORT_KEY=hole_id", "cache_key=abc", "primary_key=hole_id", "MY_TOKEN_TTL=30"])
+def test_redact_secrets_leaves_data_structure_keys(raw: str) -> None:
+    assert redact_secrets(raw) == raw
