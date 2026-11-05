@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import re
@@ -28,6 +29,7 @@ from ai_quality import (
 from models import (
     COLLAR_COLUMNS,
     LITHOLOGY_COLUMNS,
+    MAX_LITHOLOGY_DEPTH_M,
     DataParser,
     ParseResult,
     WorkbookSectionSpec,
@@ -44,7 +46,31 @@ OVERRIDES_DIR = PROFILES_DIR / "overrides"
 NATIVE_PROFILE_ID = "native_platform"
 DATA_ENTRY_PROFILE_ID = "data_entry_template"
 
-DEPTH_INTERVAL_PATTERN = re.compile(r"([\d.]+)\s*-\s*([\d.]+)")
+_DEPTH_NUMBER = r"(\d+(?:\.\d*)?|\.\d+)"
+_DEPTH_UNIT = r"(metres?|meters?|mm|cm|m|feet|foot|ft|')?"
+# "0.5-1.5", "0.00 - 2.00 m", "0-2 m bgs", "0 m-2 m", "0-10 ft", "0-10'".
+# En dash, em dash and the minus sign are normalised to "-" before matching.
+DEPTH_INTERVAL_PATTERN = re.compile(
+    rf"^{_DEPTH_NUMBER}\s*{_DEPTH_UNIT}\s*-\s*{_DEPTH_NUMBER}\s*{_DEPTH_UNIT}"
+    r"(?:\s*(?:bgs|bgl|bg))?\.?$"
+)
+_DEPTH_DASHES = str.maketrans({"\u2013": "-", "\u2014": "-", "\u2212": "-"})
+# Unit as written -> canonical unit; a blank unit is metres.
+_DEPTH_UNIT_CANONICAL = {
+    "": "m",
+    "m": "m",
+    "metre": "m",
+    "metres": "m",
+    "meter": "m",
+    "meters": "m",
+    "mm": "mm",
+    "cm": "cm",
+    "ft": "ft",
+    "feet": "ft",
+    "foot": "ft",
+    "'": "ft",
+}
+_DEPTH_UNIT_TO_M = {"m": 1.0, "cm": 0.01, "mm": 0.001, "ft": 0.3048}
 
 
 class DetectRules(BaseModel):
@@ -260,13 +286,39 @@ class DepthParser:
 
 
 def parse_depth_interval(depth_value: object) -> tuple[float, float]:
+    """``"from-to"`` depth text to metres (``0.5-1.5``, ``0-2 m bgs``, ``0-10 ft``).
+
+    A unit may follow either number (``m``, ``cm``, ``mm``, ``ft`` / ``'``; blank
+    is metres); feet, cm and mm are converted to metres. En and em dashes are
+    accepted as the separator. A date cell (Excel auto-converted ``6-1`` to a
+    date) and any other text raise ``ValueError``.
+    """
     if depth_value is None or (isinstance(depth_value, float) and pd.isna(depth_value)):
         raise ValueError("missing depth interval")
-    text = str(depth_value).strip().lower().replace("m", "")
+    if depth_value is pd.NaT:
+        raise ValueError("missing depth interval")
+    if isinstance(depth_value, (datetime.date, datetime.time)):
+        shown = depth_value.isoformat() if hasattr(depth_value, "isoformat") else str(depth_value)
+        raise ValueError(
+            f"depth interval is a date/time cell ({shown}) — Excel converted the interval "
+            "to a date; format the Depth column as Text and re-enter it as from-to "
+            "(e.g. 0.5-1.5 m)"
+        )
+    text = str(depth_value).strip().lower().translate(_DEPTH_DASHES)
     match = DEPTH_INTERVAL_PATTERN.match(text)
     if not match:
-        raise ValueError(f"cannot parse depth interval: {depth_value!r}")
-    return float(match.group(1)), float(match.group(2))
+        raise ValueError(
+            f"cannot parse depth interval: {depth_value!r} — enter it as from-to in metres "
+            "(e.g. 0.5-1.5 m)"
+        )
+    from_text, from_unit, to_text, to_unit = match.groups()
+    if from_unit and to_unit and _DEPTH_UNIT_CANONICAL[from_unit] != _DEPTH_UNIT_CANONICAL[to_unit]:
+        raise ValueError(
+            f"depth interval {depth_value!r} mixes units ({from_unit} and {to_unit}) — "
+            "use one unit for both depths"
+        )
+    factor = _DEPTH_UNIT_TO_M[_DEPTH_UNIT_CANONICAL[to_unit or from_unit or ""]]
+    return float(from_text) * factor, float(to_text) * factor
 
 
 class CoordinateTransformer:
@@ -392,8 +444,25 @@ def suggest_utm_crs(latitudes: Sequence[float], longitudes: Sequence[float]) -> 
     return f"EPSG:{32700 + zone}"
 
 
+# Two Field Data RLs for one hole further apart than this are a conflict.
+_FIELD_DATA_RL_TOLERANCE_M = 0.01
+
+
+def field_data_hole_key(hole_ids: pd.Series) -> pd.Series:
+    """Field Data lookup key: hole id stripped and casefolded (``bh-01`` ~ ``BH-01``).
+
+    Only the Field Data RL / TD lookup is case-insensitive; every other sheet
+    must match the Collars id exactly.
+    """
+    return hole_ids.astype(str).str.strip().str.casefold()
+
+
 def _field_data_maps(workbook: pd.ExcelFile) -> tuple[dict[str, float], dict[str, float]]:
-    """Read Field Data RL and TD from one sheet parse (cached on the ExcelFile instance)."""
+    """Read Field Data RL and TD from one sheet parse (cached on the ExcelFile instance).
+
+    Both maps are keyed by :func:`field_data_hole_key`. The first RL row for a
+    hole is used; a conflicting later RL adds an import note.
+    """
     cached = getattr(workbook, "_xs_field_data_maps", None)
     if cached is not None:
         return cached
@@ -456,19 +525,28 @@ def _field_data_maps(workbook: pd.ExcelFile) -> tuple[dict[str, float], dict[str
 
         if elev_col is not None:
             elev_frame = frame.loc[valid_holes, [hole_col, elev_col]].copy()
-            elev_frame["_hole_id"] = elev_frame[hole_col].astype(str).str.strip()
+            elev_frame["_hole_id"] = field_data_hole_key(elev_frame[hole_col])
             elev_frame["_rl"] = _numbers(elev_col)
             elev_frame = elev_frame.dropna(subset=["_rl"])
             if not elev_frame.empty:
-                elevations = (
-                    elev_frame.groupby("_hole_id", as_index=True)["_rl"]
-                    .first()
-                    .astype(float)
-                    .to_dict()
-                )
+                # The first RL row for a hole wins; a later row that disagrees
+                # by more than a centimetre is reported, not silently dropped.
+                for key, group in elev_frame.groupby("_hole_id", sort=False):
+                    rls = group["_rl"].astype(float)
+                    elevations[str(key)] = float(rls.iloc[0])
+                    if float(rls.max() - rls.min()) > _FIELD_DATA_RL_TOLERANCE_M:
+                        rows = ", ".join(str(int(index) + 2) for index in group.index)
+                        shown = " / ".join(
+                            f"{value:.2f} m" for value in dict.fromkeys(rls.round(2).tolist())
+                        )
+                        bool_notes.append(
+                            f"Field Data rows {rows} ({holes[group.index[0]]}): conflicting collar "
+                            f"RLs {shown} — using {rls.iloc[0]:.2f} m from row "
+                            f"{int(group.index[0]) + 2}; keep one RL per hole."
+                        )
         if td_col is not None:
             td_frame = frame.loc[valid_holes, [hole_col, td_col]].copy()
-            td_frame["_hole_id"] = td_frame[hole_col].astype(str).str.strip()
+            td_frame["_hole_id"] = field_data_hole_key(td_frame[hole_col])
             # Interval strings / non-numeric Depth values coerce to NaN → skipped.
             td_frame["_td"] = _numbers(td_col)
             td_frame = td_frame.dropna(subset=["_td"])
@@ -487,7 +565,10 @@ def _field_data_maps(workbook: pd.ExcelFile) -> tuple[dict[str, float], dict[str
 
 
 def field_data_bool_notes(workbook: pd.ExcelFile) -> tuple[str, ...]:
-    """Import notes for TRUE/FALSE cells skipped in the Field Data RL / TD columns."""
+    """Import notes for the Field Data RL / TD columns.
+
+    TRUE/FALSE cells that were skipped, and holes with conflicting RLs.
+    """
     _field_data_maps(workbook)
     return tuple(getattr(workbook, "_xs_field_data_bool_notes", ()))
 
@@ -528,7 +609,39 @@ def _reject_bool_number_cells(frame: pd.DataFrame, sheet: str, columns: Sequence
                 )
 
 
+_ADAPTER_COLLAR_COLUMNS = ["hole_id", "easting", "northing", "elevation", "total_depth"]
+_ADAPTER_LITHOLOGY_COLUMNS = ["hole_id", "from_depth", "to_depth", "lithology_code"]
+
+
+def _cell_number(value: object, field: str) -> float:
+    """One depth cell as a float; blank stays NaN (the Lithology row check reports it)."""
+    if value is None or value is pd.NaT or (isinstance(value, float) and pd.isna(value)):
+        return float("nan")
+    if isinstance(value, (datetime.date, datetime.time)):
+        raise ValueError(
+            f"{field} is a date/time cell ({value}) — format the column as Number and "
+            "re-enter the depth in metres"
+        )
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} = {str(value)!r} is not a number — enter metres only") from None
+
+
 class FieldExportAdapter:
+    """Field-export lithology sheet → canonical Collars / Lithology frames.
+
+    After :meth:`adapt`, ``row_errors`` holds one message per lithology row
+    whose depth could not be read (the row is dropped, the rest import), and
+    ``rl_applied_holes`` / ``td_applied_holes`` name the collars that took
+    their RL / total depth from the Field Data sheet.
+    """
+
+    def __init__(self) -> None:
+        self.row_errors: list[str] = []
+        self.rl_applied_holes: list[str] = []
+        self.td_applied_holes: list[str] = []
+
     def adapt(
         self,
         source: str | Path | BinaryIO | BytesIO | pd.ExcelFile,
@@ -538,6 +651,9 @@ class FieldExportAdapter:
         target_crs: str | None = None,
         workbook: pd.ExcelFile | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
+        self.row_errors = []
+        self.rl_applied_holes = []
+        self.td_applied_holes = []
         active_workbook = workbook or _as_workbook(source)
         _owned_workbook = active_workbook if workbook is None and active_workbook is not source else None
         try:
@@ -545,7 +661,7 @@ class FieldExportAdapter:
             sheet_lookup = {_normalize_header(name): name for name in active_workbook.sheet_names}
             if sheet_key not in sheet_lookup:
                 raise ValueError(f"Lithology sheet '{profile.lithology_sheet}' not found")
-            from parsing import read_data_sheet
+            from parsing import _row_error, read_data_sheet
 
             lithology_sheet = sheet_lookup[sheet_key]
             lithology_raw = read_data_sheet(active_workbook, lithology_sheet)
@@ -580,12 +696,34 @@ class FieldExportAdapter:
                 depth_col = resolved_map.get("depth_interval", "depth_interval")
                 if "depth_interval" not in frame.columns and depth_col in lithology_raw.columns:
                     frame["depth_interval"] = lithology_raw[depth_col]
-                parsed_depths = [parse_depth_interval(value) for value in frame["depth_interval"]]
-                frame["from_depth"] = [item[0] for item in parsed_depths]
-                frame["to_depth"] = [item[1] for item in parsed_depths]
-            else:
-                frame["from_depth"] = pd.to_numeric(frame["from_depth"], errors="raise")
-                frame["to_depth"] = pd.to_numeric(frame["to_depth"], errors="raise")
+            from_depths: list[float] = []
+            to_depths: list[float] = []
+            bad_rows: list[object] = []
+            # One unreadable depth is a row error, not an aborted import.
+            for index, row in frame.iterrows():
+                try:
+                    if profile.depth_format == "interval_string":
+                        top, base = parse_depth_interval(row["depth_interval"])
+                    else:
+                        top = _cell_number(row["from_depth"], "from_depth")
+                        base = _cell_number(row["to_depth"], "to_depth")
+                except ValueError as exc:
+                    self.row_errors.append(
+                        _row_error(lithology_sheet, int(index) + 2, exc, hole_id=row["hole_id"])
+                    )
+                    bad_rows.append(index)
+                    continue
+                from_depths.append(top)
+                to_depths.append(base)
+            frame = frame.drop(index=bad_rows)
+            frame["from_depth"] = pd.Series(from_depths, index=frame.index, dtype=float)
+            frame["to_depth"] = pd.Series(to_depths, index=frame.index, dtype=float)
+            if frame.empty:
+                return (
+                    pd.DataFrame(columns=_ADAPTER_COLLAR_COLUMNS),
+                    pd.DataFrame(columns=_ADAPTER_LITHOLOGY_COLUMNS),
+                    None,
+                )
 
             frame["lithology_code"] = frame["lithology_code"].astype(str).str.strip().map(
                 lambda raw: normalize_lithology_code(raw, aliases),
@@ -603,7 +741,15 @@ class FieldExportAdapter:
                     easting, northing = transformer.transform(latitude, longitude)
                 coord_cache[str(hole_id)] = (easting, northing)
 
-            max_depth_by_hole = frame.groupby("hole_id", sort=False)["to_depth"].max()
+            # Infer TD from plausible intervals only: an implausible to_depth
+            # (a date serial, a unit slip) is a Lithology row error of its own
+            # and must not also make the whole hole's collar fail.
+            plausible_to = frame["to_depth"].where(frame["to_depth"].abs() <= MAX_LITHOLOGY_DEPTH_M)
+            max_depth_by_hole = (
+                plausible_to.groupby(frame["hole_id"], sort=False)
+                .max()
+                .fillna(frame.groupby("hole_id", sort=False)["to_depth"].max())
+            )
             collar_accum = {
                 str(hole_id): {
                     "hole_id": str(hole_id),
@@ -615,16 +761,16 @@ class FieldExportAdapter:
                 for hole_id in max_depth_by_hole.index
             }
 
+            # Field Data maps are keyed by field_data_hole_key (case-insensitive).
             measured_rl, measured_td = _field_data_maps(active_workbook)
-            for hole_id, rl in measured_rl.items():
-                if hole_id in collar_accum:
-                    collar_accum[hole_id]["elevation"] = float(rl)
-            for hole_id, td in measured_td.items():
-                if hole_id in collar_accum:
-                    collar_accum[hole_id]["total_depth"] = max(
-                        float(collar_accum[hole_id]["total_depth"]),
-                        td,
-                    )
+            for hole_id, collar in collar_accum.items():
+                key = hole_id.strip().casefold()
+                if key in measured_rl:
+                    collar["elevation"] = float(measured_rl[key])
+                    self.rl_applied_holes.append(hole_id)
+                if key in measured_td and measured_td[key] >= float(collar["total_depth"]):
+                    collar["total_depth"] = float(measured_td[key])
+                    self.td_applied_holes.append(hole_id)
 
             collars_df = pd.DataFrame(collar_accum.values()).sort_values("hole_id")
             for hole_id, offset in profile.coordinate_offsets_m.items():
@@ -725,19 +871,8 @@ def ingest_workbook(
             if "Field Data" not in optional_sheets:
                 optional_sheets.append("Field Data")
             if resolved_profile_id != NATIVE_PROFILE_ID:
-                measured_rl, measured_td = _field_data_maps(workbook)
-                if measured_td:
-                    warnings.append(
-                        f"Field Data sheet: applied measured total depth for {len(measured_td)} hole(s)."
-                    )
-                if measured_rl:
-                    warnings.append(
-                        f"Field Data sheet: applied collar RL for {len(measured_rl)} hole(s)."
-                    )
-                if not measured_td:
-                    warnings.append(
-                        "Field Data sheet detected — no TD column mapped; total depth inferred from lithology."
-                    )
+                # "Applied RL / TD" notes come from the field-export adapter
+                # below, which counts the collars that actually took a value.
                 warnings.extend(field_data_bool_notes(workbook))
             # Native: OVA/EC success info is appended after parse (no future-work warning).
 
@@ -778,13 +913,30 @@ def ingest_workbook(
             profile_label = profile.label
             profile_default_elevation_m = profile.defaults.elevation_m
 
-            collars_df, lithology_df, suggested_from_adapt = FieldExportAdapter().adapt(
+            adapter = FieldExportAdapter()
+            collars_df, lithology_df, suggested_from_adapt = adapter.adapt(
                 source,
                 profile,
                 elevation_m=elevation_m,
                 target_crs=target_crs,
                 workbook=workbook,
             )
+            if "Field Data" in optional_sheets:
+                _, measured_td = _field_data_maps(workbook)
+                if adapter.td_applied_holes:
+                    warnings.append(
+                        "Field Data sheet: applied measured total depth for "
+                        f"{len(adapter.td_applied_holes)} hole(s)."
+                    )
+                if adapter.rl_applied_holes:
+                    warnings.append(
+                        "Field Data sheet: applied collar RL for "
+                        f"{len(adapter.rl_applied_holes)} hole(s)."
+                    )
+                if not measured_td:
+                    warnings.append(
+                        "Field Data sheet detected — no TD column mapped; total depth inferred from lithology."
+                    )
             effective_crs = target_crs or profile.coordinates.target_crs
             if suggested_from_adapt and target_crs is None:
                 suggested_utm_crs = suggested_from_adapt
@@ -800,10 +952,23 @@ def ingest_workbook(
                 if len(offset) == 2:
                     offsets_applied[hole_id] = (float(offset[0]), float(offset[1]))
             if elevation_m is None:
-                warnings.append(
-                    f"Collar elevation uses profile default ({profile.defaults.elevation_m:.1f} m) — "
-                    "set sidebar elevation for absolute RL sections."
-                )
+                # Only collars without a Field Data RL sit at the profile default.
+                with_rl = set(adapter.rl_applied_holes)
+                defaulted = [
+                    str(hole) for hole in collars_df["hole_id"] if str(hole) not in with_rl
+                ]
+                if defaulted and not with_rl:
+                    warnings.append(
+                        f"Collar elevation uses profile default ({profile.defaults.elevation_m:.1f} m) — "
+                        "set sidebar elevation for absolute RL sections."
+                    )
+                elif defaulted:
+                    shown = ", ".join(defaulted[:5]) + (" …" if len(defaulted) > 5 else "")
+                    warnings.append(
+                        f"Collar elevation uses profile default ({profile.defaults.elevation_m:.1f} m) "
+                        f"for {len(defaulted)} hole(s) with no Field Data RL ({shown}) — add their "
+                        "RL to Field Data or set sidebar elevation for absolute RL sections."
+                    )
             parse_result = DataParser().parse_file(
                 source,
                 collars_df=collars_df,
@@ -811,6 +976,10 @@ def ingest_workbook(
                 lithology_aliases=aliases,
                 workbook=workbook,
             )
+            if adapter.row_errors:
+                parse_result = parse_result.model_copy(
+                    update={"errors": tuple(adapter.row_errors) + tuple(parse_result.errors)}
+                )
 
         if (
             not project_metadata
@@ -1047,16 +1216,32 @@ def export_platform_workbook(
             collars_df, lithology_df, _ = _native_adapt(source, workbook=workbook)
         else:
             profile = load_override(override_id) if override_id else load_profile(resolved_profile_id)
-            collars_df, lithology_df, _ = FieldExportAdapter().adapt(
+            adapter = FieldExportAdapter()
+            collars_df, lithology_df, _ = adapter.adapt(
                 source,
                 profile,
                 elevation_m=elevation_m,
                 target_crs=target_crs,
                 workbook=workbook,
             )
+            if adapter.row_errors:
+                # A converted workbook must not silently lose intervals.
+                shown = "\n".join(adapter.row_errors[:20])
+                more = len(adapter.row_errors) - 20
+                if more > 0:
+                    shown += f"\n… and {more} more row error(s)"
+                raise ValueError(
+                    f"{len(adapter.row_errors)} lithology row(s) could not be read — fix them "
+                    f"and convert again:\n{shown}"
+                )
             if elevation_m is None:
                 # Not a surveyed RL: tag it so a re-import still flags placeholders.
-                collars_df["elevation_datum"] = _placeholder_datum(profile.defaults.elevation_m)
+                # Collars that took their RL from Field Data are surveyed.
+                with_rl = set(adapter.rl_applied_holes)
+                collars_df["elevation_datum"] = [
+                    None if str(hole) in with_rl else _placeholder_datum(profile.defaults.elevation_m)
+                    for hole in collars_df["hole_id"]
+                ]
 
         output.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
