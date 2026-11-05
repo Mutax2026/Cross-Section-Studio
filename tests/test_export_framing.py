@@ -405,3 +405,31 @@ def test_avoid_windows_reserved_name_matches_the_part_before_the_first_dot(stem:
     from export_framing import avoid_windows_reserved_name
 
     assert avoid_windows_reserved_name(stem) == expected
+
+
+def test_draft_watermark_is_applied_once_per_figure() -> None:
+    """QA: each export of the same figure stacked another DRAFT artist (1, 2,
+    3, 4 ...), so the stamp darkened and the PDF text repeated it."""
+    from matplotlib.figure import Figure
+
+    from export_framing import DRAFT_WATERMARK_GID, apply_draft_watermark
+
+    fig = Figure()
+    framing = ExportFramingConfig(show_draft_watermark=True)
+    for _ in range(4):
+        apply_draft_watermark(fig, framing)
+    marks = [text for text in fig.texts if text.get_text() == "DRAFT"]
+    assert len(marks) == 1
+    assert marks[0].get_gid() == DRAFT_WATERMARK_GID
+    # A plain "DRAFT" label someone else drew is not mistaken for the stamp.
+    other = Figure()
+    other.text(0.1, 0.1, "DRAFT")
+    apply_draft_watermark(other, framing)
+    assert [t.get_gid() for t in other.texts if t.get_text() == "DRAFT"] == [
+        None,
+        DRAFT_WATERMARK_GID,
+    ]
+    # Flag off: nothing drawn.
+    off = Figure()
+    apply_draft_watermark(off, ExportFramingConfig())
+    assert not off.texts
