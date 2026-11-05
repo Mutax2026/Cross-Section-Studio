@@ -606,3 +606,12 @@ def test_normalize_pdf_pages_fits_every_page_on_letter_landscape() -> None:
     normalized = _pdf_pages(normalize_pdf_pages(pdf))
     assert {page[:2] for page in normalized} == {(11.0, 8.5)}
     assert "QA notes" in normalized[1][2]
+
+
+def test_override_code_change_note_reaches_configure_preflight() -> None:
+    """Configure shows fence notes by prefix; the override facies note must be one."""
+    from pipeline import FENCE_NOTE_PREFIXES
+    from stratigraphy import OVERRIDE_CODE_CHANGE_PREFIX
+
+    note = f"{OVERRIDE_CODE_CHANGE_PREFIX} BH-01–BH-02: Clay joined to Silt"
+    assert note.startswith(FENCE_NOTE_PREFIXES)

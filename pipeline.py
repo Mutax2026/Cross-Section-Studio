@@ -78,6 +78,7 @@ from render_profiles import (
 from render_theme import filter_water_levels_for_plot
 from renderer import CrossSectionRenderer
 from stratigraphy import (
+    OVERRIDE_CODE_CHANGE_PREFIX,
     CorrelationPairSummary,
     GeologicalPolygon,
     PolygonOverlap,
@@ -93,7 +94,8 @@ logger = logging.getLogger(__name__)
 _RENDER_LOCK = RENDER_LOCK
 
 CROSSING_CORRELATION_PREFIX = "Crossing correlation"
-FENCE_NOTE_PREFIXES = (CROSSING_CORRELATION_PREFIX, "Fence clipped")
+# Fence notes Configure preflight shows before Generate (app_services filters on these).
+FENCE_NOTE_PREFIXES = (CROSSING_CORRELATION_PREFIX, "Fence clipped", OVERRIDE_CODE_CHANGE_PREFIX)
 
 
 def _merge_optional_profile_updates(
