@@ -93,6 +93,62 @@ def test_ecoventure_gwm_hole_order_matches_transect_spec() -> None:
         assert tuple(subset.collars[i].easting for i in range(len(subset.collars))) == spec.profile_eastings
 
 
+@pytest.mark.parametrize("transect_id", tuple(GWM_TRANSECTS.keys()))
+def test_ecoventure_gwm_projected_hole_order_matches_transect_spec(transect_id: str) -> None:
+    """The section's left-to-right hole order comes from projection, not input order.
+
+    The fixture collars sit on the x axis in spec order, so reading them back
+    proves nothing. Here each hole is placed in map coordinates on a rotated
+    line (azimuth 135 degrees, UTM-sized origin) with alternating off-line offsets,
+    and handed to the pipeline in reverse order; only projection onto the
+    transect can recover the spec order and chainage.
+    """
+    import math
+
+    from models import Collar
+    from pipeline import compute_section_geometry
+
+    spec, subset = build_subset(transect_id)
+    chainage_by_hole = dict(zip(spec.hole_ids, spec.profile_eastings, strict=True))
+    fixture_by_hole = {collar.hole_id: collar for collar in subset.collars}
+
+    origin_e, origin_n = 512_345.0, 6_012_345.0
+    azimuth = math.radians(135.0)  # NW -> SE, so map easting is not chainage
+    along = (math.sin(azimuth), math.cos(azimuth))
+    across = (along[1], -along[0])
+    input_order = tuple(reversed(spec.hole_ids))
+    collars = []
+    for index, hole_id in enumerate(input_order):
+        chainage = chainage_by_hole[hole_id]
+        offset = 5.0 if index % 2 == 0 else -5.0
+        fixture = fixture_by_hole[hole_id]
+        collars.append(
+            Collar(
+                hole_id=hole_id,
+                easting=origin_e + chainage * along[0] + offset * across[0],
+                northing=origin_n + chainage * along[1] + offset * across[1],
+                elevation=fixture.elevation,
+                total_depth=fixture.total_depth,
+            )
+        )
+    length = max(spec.profile_eastings)
+    transect_points = [
+        (origin_e, origin_n),
+        (origin_e + length * along[0], origin_n + length * along[1]),
+    ]
+    # Neither the input order nor an alphabetical sort is the spec order, so
+    # a projection that kept either would fail below.
+    assert tuple(c.hole_id for c in collars) != spec.hole_ids
+    assert tuple(sorted(spec.hole_ids)) != spec.hole_ids
+
+    geometry = compute_section_geometry(collars, list(subset.lithologies), transect_points)
+    stations = geometry.projected.groupby("hole_id", sort=False)["x_profile"].first()
+    projected_order = tuple(stations.sort_values(kind="stable").index)
+    assert projected_order == spec.hole_ids
+    for hole_id, chainage in chainage_by_hole.items():
+        assert stations[hole_id] == pytest.approx(chainage, abs=1e-6)
+
+
 def test_ecoventure_dual_gw_series_a_a() -> None:
     spec, subset = build_subset("A_A")
     series_ids = {level.series_id for level in subset.water_levels}
