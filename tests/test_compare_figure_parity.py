@@ -197,3 +197,23 @@ def test_suite_gate_fails_swapped_mapping() -> None:
         warn_mse=False,
     )
     assert any("section" in f for f in failures)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "CROSS SECTION A - A'",
+        "Cross Section A-A'",
+        "CROSS-SECTION A-A'",
+        "CROSS SECTION A–A'",
+        "CROSS SECTION A-A’",
+        "CROSS SECTION A-A′",
+        "CROSS SECTION A-A&#39;",
+    ],
+)
+def test_section_label_accepts_title_variants(tmp_path: Path, title: str) -> None:
+    """A correct figure must not fail the label check over case, dash or apostrophe style."""
+    png = tmp_path / "fig.png"
+    png.write_bytes(b"")
+    png.with_suffix(".svg").write_text(f"<svg><text>{title}</text></svg>", encoding="utf-8")
+    assert cfp.section_labels_from_svg(png) == {"A"}

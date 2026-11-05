@@ -25,6 +25,7 @@ therefore hard-fail regardless of ``--warn-only``:
 from __future__ import annotations
 
 import argparse
+import html
 import re
 import sys
 from pathlib import Path
@@ -88,7 +89,12 @@ SECTION_LABELS: dict[str, str] = {
     "p2_fig_7": "B",
 }
 
-_SECTION_TITLE_RE = re.compile(r"CROSS SECTION\s+([A-Z])\s*-\s*([A-Z])'")
+# Title wording varies: any case, "CROSS-SECTION", en/em dashes, and a
+# straight, curly or prime apostrophe after the second letter.
+_SECTION_TITLE_RE = re.compile(
+    r"CROSS[\s-]SECTION\s+([A-Z])\s*[-‐-―]\s*([A-Z])\s*['’′]",
+    re.IGNORECASE,
+)
 # Reference extracts: "...Fig 3 Cross Section A-A'.png" / "fig_6_cross_section_a_a.png".
 _SECTION_FILENAME_RE = re.compile(r"cross[ _]section[ _]([a-z])[-_ ]([a-z])", re.IGNORECASE)
 
@@ -131,9 +137,10 @@ def section_labels_from_svg(generated_png: Path) -> set[str] | None:
     svg = generated_png.with_suffix(".svg")
     if not svg.is_file():
         return None
-    text = svg.read_text(encoding="utf-8", errors="replace")
+    text = html.unescape(svg.read_text(encoding="utf-8", errors="replace"))
     labels: set[str] = set()
     for start, end in _SECTION_TITLE_RE.findall(text):
+        start, end = start.upper(), end.upper()
         labels.add(start if start == end else f"{start}-{end}")
     return labels
 
