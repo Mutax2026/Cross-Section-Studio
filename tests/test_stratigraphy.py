@@ -268,69 +268,124 @@ def test_detect_polygon_overlaps_finds_nested_containment() -> None:
     }
 
 
-def test_correlation_override_increases_matched_units() -> None:
-    projected = pd.DataFrame(
+def _projected_override_pair(right_top_code: str = "Silt") -> pd.DataFrame:
+    """BH-01 Clay over Sand; BH-02 ``right_top_code`` over Sand (unit orders 1, 2)."""
+
+    def row(hole_id: str, x: float, top: float, bottom: float, code: str, order: int) -> dict:
+        return {
+            "hole_id": hole_id,
+            "x_profile": x,
+            "collar_elevation": 100.0,
+            "top_elevation": top,
+            "bottom_elevation": bottom,
+            "lithology_code": code,
+            "unit_order": order,
+        }
+
+    return pd.DataFrame(
         [
-            {
-                "hole_id": "BH-01",
-                "x_profile": 0.0,
-                "collar_elevation": 100.0,
-                "top_elevation": 100.0,
-                "bottom_elevation": 90.0,
-                "lithology_code": "Clay",
-                "unit_order": 1,
-            },
-            {
-                "hole_id": "BH-01",
-                "x_profile": 0.0,
-                "collar_elevation": 100.0,
-                "top_elevation": 90.0,
-                "bottom_elevation": 80.0,
-                "lithology_code": "Sand",
-                "unit_order": 2,
-            },
-            {
-                "hole_id": "BH-02",
-                "x_profile": 50.0,
-                "collar_elevation": 100.0,
-                "top_elevation": 100.0,
-                "bottom_elevation": 88.0,
-                "lithology_code": "Silt",
-                "unit_order": 1,
-            },
-            {
-                "hole_id": "BH-02",
-                "x_profile": 50.0,
-                "collar_elevation": 100.0,
-                "top_elevation": 88.0,
-                "bottom_elevation": 78.0,
-                "lithology_code": "Sand",
-                "unit_order": 2,
-            },
+            row("BH-01", 0.0, 100.0, 90.0, "Clay", 1),
+            row("BH-01", 0.0, 90.0, 80.0, "Sand", 2),
+            row("BH-02", 50.0, 100.0, 88.0, right_top_code, 1),
+            row("BH-02", 50.0, 88.0, 78.0, "Sand", 2),
         ]
     )
+
+
+_TOP_UNITS_OVERRIDE = (
+    CorrelationOverride(
+        left_hole_id="BH-01",
+        right_hole_id="BH-02",
+        left_unit_order=1,
+        right_unit_order=1,
+    ),
+)
+
+
+def test_correlation_override_increases_matched_units() -> None:
+    projected = _projected_override_pair("Silt")
     without = build_stratigraphy(projected, allow_pinch_outs=True)
     with_override = build_stratigraphy(
         projected,
         allow_pinch_outs=True,
-        correlation_overrides=[
-            CorrelationOverride(
-                left_hole_id="BH-01",
-                right_hole_id="BH-02",
-                left_unit_order=1,
-                right_unit_order=1,
-            )
-        ],
+        correlation_overrides=_TOP_UNITS_OVERRIDE,
     )
     assert any(
         polygon.lithology_code == "Clay" and not polygon.is_pinch_out
         for polygon in with_override
     )
     assert any(polygon.is_pinch_out for polygon in without)
+    assert not any(polygon.is_pinch_out for polygon in with_override)
     # Remapped Clay/Silt pair must not also leave an orphan pinch-out for the same intervals.
     clay_polygons = [p for p in with_override if p.lithology_code == "Clay"]
     assert len(clay_polygons) == 1
     assert not clay_polygons[0].is_pinch_out
+    # The right hole's Silt is still drawn (codes differ: facies change, see below).
+    silt_polygons = [p for p in with_override if p.lithology_code == "Silt"]
+    assert len(silt_polygons) == 1
+    assert not silt_polygons[0].is_pinch_out
+
+
+def test_correlation_override_joining_different_codes_draws_facies_change() -> None:
+    """Regression (review F1): an override joining Clay (BH-01) to Silt (BH-02) drew
+    one Clay fill across the whole panel, hid BH-02's Silt and counted as a clean
+    match with no note. It is a facies change at mid-span, reported as such."""
+    projected = _projected_override_pair("Silt")
+    summaries: list = []
+    notes: list[str] = []
+    polygons = build_stratigraphy(
+        projected,
+        allow_pinch_outs=True,
+        correlation_overrides=_TOP_UNITS_OVERRIDE,
+        pair_summaries=summaries,
+        clip_warnings=notes,
+    )
+    by_code = {polygon.lithology_code: polygon.polygon for polygon in polygons}
+    assert sorted(by_code) == ["Clay", "Sand", "Silt"]
+    # Clay from BH-01 to mid-span, Silt from mid-span to BH-02, meeting on a
+    # vertical boundary at x = 25 that follows the joined unit's base contact.
+    assert by_code["Clay"].bounds == pytest.approx((0.0, 89.0, 25.0, 100.0))
+    assert by_code["Silt"].bounds == pytest.approx((25.0, 88.0, 50.0, 100.0))
+    assert by_code["Clay"].area + by_code["Silt"].area == pytest.approx(0.5 * (10.0 + 12.0) * 50.0)
+    shared = by_code["Clay"].intersection(by_code["Silt"])
+    assert shared.area == pytest.approx(0.0)
+    assert shared.length == pytest.approx(11.0)
+    assert detect_polygon_overlaps(polygons) == []
+
+    assert len(notes) == 1
+    note = notes[0]
+    for text in ("BH-01", "BH-02", "Clay", "Silt", "facies change"):
+        assert text in note
+
+    for summary in (
+        summaries[0],
+        preview_correlation_health(projected, correlation_overrides=_TOP_UNITS_OVERRIDE)[0],
+    ):
+        assert summary.matched_count == 1  # Sand only
+        assert summary.override_code_changes == (("Clay", "Silt"),)
+        assert summary.unmatched_keys_count == 1
+        assert summary.match_rate == pytest.approx(0.5)
+
+
+def test_correlation_override_joining_same_code_stays_one_fill() -> None:
+    projected = _projected_override_pair("Clay")
+    summaries: list = []
+    notes: list[str] = []
+    polygons = build_stratigraphy(
+        projected,
+        allow_pinch_outs=True,
+        correlation_overrides=_TOP_UNITS_OVERRIDE,
+        pair_summaries=summaries,
+        clip_warnings=notes,
+    )
+    clay = [p for p in polygons if p.lithology_code == "Clay"]
+    assert len(clay) == 1
+    assert clay[0].polygon.bounds == pytest.approx((0.0, 88.0, 50.0, 100.0))
+    assert sorted(p.lithology_code for p in polygons) == ["Clay", "Sand"]
+    assert notes == []
+    assert summaries[0].matched_count == 2
+    assert summaries[0].override_code_changes == ()
+    assert summaries[0].match_rate == pytest.approx(1.0)
 
 
 def test_correlation_override_accepts_reversed_hole_order() -> None:
