@@ -644,3 +644,29 @@ def test_draft_watermark_stamps_every_pdf_page_in_every_layout() -> None:
             export_formats=frozenset({"pdf"}),
         )
         assert all("DRAFT" not in text for _, _, text in _pdf_pages(final.pdf_bytes)), layout
+
+
+def test_off_transect_warnings_reach_geometry_notes_and_pdf() -> None:
+    """QA: Generate showed "BH-01 is 5.0 m from transect" but the pipeline only
+    logged it, so the PDF QA page and Word pack never said so."""
+    from projection import off_transect_warnings
+    from models import Transect
+
+    collars, lithology = _crossing_holes()
+    line = [(0, 5), (50, 5)]
+    expected = off_transect_warnings(collars, Transect(points=line), 1.0)
+    assert expected == [
+        "A is 5.0 m from transect (threshold 1.0 m)",
+        "B is 5.0 m from transect (threshold 1.0 m)",
+    ]
+    geometry = compute_section_geometry(collars, lithology, line, offset_warning_m=1.0)
+    assert [w for w in geometry.overlap_warnings if "from transect" in w] == expected
+    result = build_cross_section(
+        collars, lithology, line, offset_warning_m=1.0, export_formats=frozenset({"pdf"})
+    )
+    assert [w for w in result.overlap_warnings if "from transect" in w] == expected
+    pdf_text = " ".join(text for _, _, text in _pdf_pages(result.pdf_bytes))
+    assert all(message in pdf_text for message in expected)
+    # Under the threshold: no note.
+    near = compute_section_geometry(collars, lithology, line, offset_warning_m=10.0)
+    assert not [w for w in near.overlap_warnings if "from transect" in w]

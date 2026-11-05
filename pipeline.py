@@ -56,6 +56,7 @@ from projection import (
     DEFAULT_OFFSET_WARNING_M,
     AlongHoleTVD,
     build_along_hole_tvd,
+    off_transect_warnings,
     project_boreholes,
     transect_azimuth_deg,
 )
@@ -335,7 +336,13 @@ def compute_section_geometry(
     ] + clip_warnings
     for message in fence_notes:
         logger.warning(message)
-    overlap_warnings = overlap_warnings + tuple(correlation_warnings) + tuple(fence_notes)
+    # Holes beyond the offset warning distance: Generate shows these, so the
+    # PDF QA page and Word pack must carry them too (same wording as the app).
+    # ``offset_warning_m`` is already in ``geometry_cache_payload``.
+    transect_notes = tuple(off_transect_warnings(collars, transect, offset_warning_m))
+    overlap_warnings = (
+        transect_notes + overlap_warnings + tuple(correlation_warnings) + tuple(fence_notes)
+    )
     if fail_on_overlaps and overlap_pairs:
         raise ValueError(
             f"Polygon overlap detected ({len(overlap_pairs)} pair(s)); "
